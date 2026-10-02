@@ -13,6 +13,8 @@ import {
 	IconCopy,
 	IconWaveSine,
 	IconCircleDashed,
+	IconClick,
+	IconBoxModel2,
 } from "@tabler/icons-react";
 import "./AnnotationToolbar.css";
 import NumberSliderField from "../NumberSliderField";
@@ -110,6 +112,8 @@ const TOOL_DEFS: Array<{ id: Exclude<PrimaryEditTool, null>; label: string; Icon
 	{ id: "fillBetweenSlices", label: "Fill between slices", Icon: IconStack2, description: "Interpolate a class's shape between two annotated slices." },
 	{ id: "copyAcrossSlices", label: "Copy across slices", Icon: IconCopy, description: "Copy a class's shape from first to last slice." },
 	{ id: "hollow", label: "Hollow", Icon: IconCircleDashed, description: "Make the class hollow by replacing it with a uniform-thickness shell." },
+	{ id: "pointSegment", label: "AI Point Segment", Icon: IconClick, description: "Click a point to propose an AI segmentation for the active class." },
+	{ id: "boxSegment", label: "AI Box Segment", Icon: IconBoxModel2, description: "Draw a 2D bounding box to propose an AI segmentation for the active class." },
 ];
 
 const SCISSORS_OPERATIONS: { value: ScissorsOperation; label: string }[] = [
