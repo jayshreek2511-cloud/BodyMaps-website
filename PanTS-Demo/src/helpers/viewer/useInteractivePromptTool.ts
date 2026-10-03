@@ -5,7 +5,7 @@
 // simpler point/box prompt gesture: a single click submits immediately in
 // "point" mode; a click-drag defines two corners and submits on mouseup in
 // "box" mode.
-import { useCallback, useRef, useState, type MouseEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type MouseEvent } from "react";
 import {
 	canvasPointToWorld,
 	worldToCanvasPoint,
@@ -84,18 +84,26 @@ export function useInteractivePromptTool({
 		setStatus("applying");
 		setStatusMessage(null);
 		try {
-			const changed = await submitInteractiveSegmentPrompt(
+			const { changed, engine, blocked } = await submitInteractiveSegmentPrompt(
 				apiBase,
 				caseId,
 				activeSegmentIndex,
 				{ pointLps: pointWorld, boxLps: boxWorld, tolerance },
 				res,
 			);
-			if (changed) {
-				const msg = `Interactive segment (${changed.toLocaleString()} vox)`;
+			if (blocked) {
+				// A guard blocked the write — nothing was committed to the labelmap.
+				onLog?.(blocked);
+				setStatus("error");
+				setStatusMessage(blocked);
+			} else if (changed) {
+				const engineLabel = engine === "nninteractive"
+					? "AI (nnInteractive)"
+					: "fallback (nnInteractive unavailable)";
+				const msg = `Applied via ${engineLabel} — ${changed.toLocaleString()} voxels changed`;
 				onLog?.(msg);
 				setStatus("success");
-				setStatusMessage("Operation completed successfully");
+				setStatusMessage(msg);
 				onComplete?.();
 			} else {
 				const msg = "Interactive segment: nothing grew from that point — try a different spot.";
@@ -169,6 +177,59 @@ export function useInteractivePromptTool({
 			void submit(pane, startWorld, [startWorld, endWorld]);
 		}
 	};
+
+	// While a box drag is in progress, listen for pointerup and Escape on the
+	// window so the drag always completes (or cancels) even if the pointer
+	// leaves the pane div before the user releases.
+	useEffect(() => {
+		if (mode !== "box" || !dragStartWorld || !dragStartCanvas) return;
+
+		const onPointerUp = (e: PointerEvent) => {
+			const startWorld = dragStartWorld;
+			const startCanvas = dragStartCanvas;
+			// Compute end canvas position relative to the active pane element.
+			// The pane divs in VisualizationPage use class names matching the
+			// pane id: "axial", "sagittal", "coronal".
+			// Fall back to startCanvas if not found (submits as a point).
+			let endCanvasPos: [number, number] = startCanvas;
+			if (paneRef.current) {
+				const paneEl = document.querySelector(
+					`.${paneRef.current}`
+				) as HTMLElement | null;
+				if (paneEl) {
+					const rect = paneEl.getBoundingClientRect();
+					endCanvasPos = [e.clientX - rect.left, e.clientY - rect.top];
+				}
+			}
+			const currentPane = paneRef.current;
+			reset();
+			if (!currentPane) return;
+			const endWorld = canvasPointToWorld(currentPane, endCanvasPos);
+			if (!endWorld) return;
+			const dx = Math.abs(endCanvasPos[0] - startCanvas[0]);
+			const dy = Math.abs(endCanvasPos[1] - startCanvas[1]);
+			if (dx < 4 && dy < 4) {
+				void submit(currentPane, startWorld);
+			} else {
+				void submit(currentPane, startWorld, [startWorld, endWorld]);
+			}
+		};
+
+		const onKeyDown = (e: KeyboardEvent) => {
+			if (e.key === "Escape") {
+				reset();
+			}
+		};
+
+		window.addEventListener("pointerup", onPointerUp);
+		window.addEventListener("keydown", onKeyDown);
+		return () => {
+			window.removeEventListener("pointerup", onPointerUp);
+			window.removeEventListener("keydown", onKeyDown);
+		};
+		// dragStartWorld/dragStartCanvas trigger the effect when a drag starts.
+		// submit and reset are stable useCallback refs.
+	}, [mode, dragStartWorld, dragStartCanvas, submit, reset]);
 
 	// Canvas-space live box for the overlay, reprojected against the CURRENT
 	// camera on every render, same reasoning as usePolygonDraw's toCanvas().

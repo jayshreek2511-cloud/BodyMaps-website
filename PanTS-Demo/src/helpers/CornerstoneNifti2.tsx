@@ -97,6 +97,14 @@ const MEASUREMENT_ANNOTATION_STYLE = {
 
 const renderingEngineId = "rendering_engine";
 const toolGroupId = "myToolGroup";
+
+// Maximum fraction of the total segmentation volume that an interactive-segment
+// proposal is allowed to change. A result above this threshold is almost certainly
+// a region_grow flood (e.g. all soft tissue) and must not be written to the labelmap.
+// 15 % is large enough to contain a whole liver or spleen on a typical abdominal CT
+// and small enough to reject an obvious flood.
+const INTERACTIVE_MASK_MAX_FRACTION = 0.15;
+
 const DEFAULT_SEGMENTATION_CONFIG = {
     fillAlpha: 0.6,
     fillAlphaInactive: 0.6,
@@ -874,6 +882,24 @@ export function toggleCrosshairTool(enable: boolean) {
       bindings: [{ mouseButton: csToolsEnums.MouseBindings.Primary }],
     });
   }
+}
+
+/**
+ * Releases the primary mouse button from ALL navigation tools (Crosshairs and
+ * Pan) so that a React-side drag handler (e.g. AI Box Segment) owns the
+ * primary button exclusively. No Cornerstone tool is left active on primary,
+ * which means Cornerstone won't pan/navigate while the user draws a box.
+ *
+ * Call this instead of toggleCrosshairTool(false) when activating
+ * pointSegment or boxSegment. Restore with toggleCrosshairTool(crosshairActive)
+ * on deactivation — the existing restore path in VisualizationPage's effect
+ * already does the right thing.
+ */
+export function releasePromptMouseButton() {
+  const toolGroup = ToolGroupManager.getToolGroup(toolGroupId);
+  if (!toolGroup) return;
+  toolGroup.setToolDisabled(CrosshairsTool.toolName);
+  toolGroup.setToolDisabled(PanTool.toolName);
 }
 
 // The magnify loupes only make sense while the tool is in hand — remove them when
@@ -2110,7 +2136,7 @@ export async function submitInteractiveSegmentPrompt(
   activeSegmentIndex: number,
   prompt: InteractivePrompt,
   res: "low" | "full",
-): Promise<number> {
+): Promise<{ changed: number; engine: string; blocked?: string }> {
   const segVolume = cache.getVolume(segmentationId);
   if (!segVolume) throw new Error("No segmentation loaded for this case.");
 
@@ -2132,13 +2158,30 @@ export async function submitInteractiveSegmentPrompt(
     body: JSON.stringify(body),
   });
   if (!httpRes.ok) {
-    let msg = `Interactive segmentation failed (${httpRes.status}).`;
+    // The backend always returns {"error": "...", "reason": "<code>"} for failures.
+    // Map each reason code to a clear, actionable message for the user.
+    let reason = "";
+    let serverMsg = "";
     try {
       const j = await httpRes.json();
-      if (j?.error) msg = j.error;
-    } catch { /* body wasn't JSON — keep the generic message */ }
+      reason = j?.reason ?? "";
+      serverMsg = j?.error ?? "";
+    } catch { /* non-JSON body — fall through to status-based message */ }
+
+    const REASON_MESSAGES: Record<string, string> = {
+      server_unreachable: "Cannot reach the AI server. Check that the Colab server and tunnel are running.",
+      auth_failed:        "The AI server rejected the API key. Update the key in flask-server/.env and restart Flask.",
+      session_expired:    "The AI session expired. Please click again.",
+      empty_mask:         "AI found nothing at that point. Try clicking closer to the center of the organ.",
+      resolution_mismatch:"Result size does not match the viewer. Reload the page and try again.",
+    };
+    const msg = REASON_MESSAGES[reason] ?? serverMsg ?? `Interactive segmentation failed (${httpRes.status}).`;
     throw new Error(msg);
   }
+
+  // Read the engine header before consuming the body (headers are available
+  // immediately; body is a stream that we drain below).
+  const engine = httpRes.headers.get("X-Engine-Used") ?? "unknown";
 
   const gz = await httpRes.arrayBuffer();
   const niiBytes = await _decompressGzip(gz);
@@ -2166,9 +2209,35 @@ export async function submitInteractiveSegmentPrompt(
   if (segDims[0] !== proposal.dims[0] || segDims[1] !== proposal.dims[1] || segDims[2] !== proposal.dims[2]) {
     // Grid mismatch — almost certainly `res` didn't match the segmentation
     // volume's current resolution. Refuse rather than silently misapply.
-    throw new Error(
-      "The proposal's resolution doesn't match the loaded segmentation — try again once loading finishes."
-    );
+    throw new Error("Result size does not match the viewer. Reload the page and try again.");
+  }
+
+  // FIX A — block region_grow results entirely: nnInteractive unavailable means
+  // the fallback would flood all connected soft tissue into the active class,
+  // overwriting neighbouring organs. Refuse without touching the labelmap.
+  // "nninteractive_empty" never reaches here (backend returns 422 before sending
+  // a body), so this guard only fires for region_grow / unknown fallbacks.
+  // With Part 8's SegmentError changes, region_grow is no longer returned by
+  // the route — but keep this as a safety net for unknown engine values.
+  if (engine !== "nninteractive") {
+    return {
+      changed: 0,
+      engine,
+      blocked: "Cannot reach the AI server. Check that the Colab server and tunnel are running." as string | undefined,
+    };
+  }
+
+  // FIX B — size sanity guard: a proposal that would change more than
+  // INTERACTIVE_MASK_MAX_FRACTION of the total volume is almost certainly a
+  // flood (e.g. region_grow on soft tissue). Refuse without touching the labelmap.
+  const totalVoxels = proposal.data.length;
+  const proposedSet = proposal.data.reduce((n, v) => n + (v ? 1 : 0), 0);
+  if (proposedSet / totalVoxels > INTERACTIVE_MASK_MAX_FRACTION) {
+    return {
+      changed: 0,
+      engine,
+      blocked: `Result looks too large (${Math.round((proposedSet / totalVoxels) * 100)}% of volume) — no change was applied.` as string | undefined,
+    };
   }
 
   let changed = 0;
@@ -2221,7 +2290,7 @@ export async function submitInteractiveSegmentPrompt(
     }
   }
 
-  return changed;
+  return { changed, engine, blocked: undefined };
 }
 
 /**

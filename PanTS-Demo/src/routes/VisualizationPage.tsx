@@ -143,6 +143,7 @@ import {
     subscribeToSliceChanges,
     subscribeToVolumeProgress,
     toggleCrosshairTool,
+    releasePromptMouseButton,
     undoMaskEdit,
     upgradeCtVolume,
     upgradeSegmentationVolume,
@@ -1639,7 +1640,16 @@ function VisualizationPage({ liveRoom, soloChallenge, quizPractice }: Visualizat
 		if (editMode === "brush" || editMode === "eraser") {
 			setActiveMeasurementTool(null);
 			setActiveMaskEditTool(editMode === "brush" ? EDIT_BRUSH : EDIT_ERASER);
-		} else if (editMode === "smartfill" || activeToolbarTool === "pointSegment" || activeToolbarTool === "boxSegment") {
+		} else if (activeToolbarTool === "pointSegment" || activeToolbarTool === "boxSegment") {
+			// AI prompt tools: release the primary button from ALL navigation tools
+			// (crosshair AND pan) so a React-side drag owns the mouse exclusively.
+			// toggleCrosshairTool(false) would re-arm PanTool, causing the viewport
+			// to pan while the user draws a box. releasePromptMouseButton() leaves
+			// no Cornerstone tool active on primary.
+			setActiveMeasurementTool(null);
+			setActiveMaskEditTool(null);
+			releasePromptMouseButton();
+		} else if (editMode === "smartfill") {
 			setActiveMeasurementTool(null);
 			setActiveMaskEditTool(null);
 			toggleCrosshairTool(false);
