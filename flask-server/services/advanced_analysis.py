@@ -102,11 +102,35 @@ def region_grow(
 USE_NNINTERACTIVE = True
 
 
-def segment_from_prompt(ct: np.ndarray, affine: np.ndarray, prompt: dict, case_key: str | None = None) -> np.ndarray:
+class SegmentError(Exception):
+    """Raised by segment_from_prompt when nnInteractive fails with a known reason.
+
+    `reason` is one of: server_unreachable, auth_failed, session_expired, empty_mask.
+    The caller (interactive_segment route) maps each reason to a distinct HTTP status
+    and JSON field so the frontend can show a targeted message.
+    """
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(detail or reason)
+        self.reason = reason
+        self.detail = detail
+
+
+def segment_from_prompt(
+    ct: np.ndarray,
+    affine: np.ndarray,
+    prompt: dict,
+    case_key: str | None = None,
+) -> tuple[np.ndarray, str]:
     """Model-agnostic entry point for the click-to-segment tool.
 
     `case_key` (e.g. "17:full") lets the nnInteractive path cache the
     uploaded volume across requests for the same case+resolution.
+
+    Returns (mask, engine) where engine is "nninteractive" on success.
+
+    Raises SegmentError with .reason in:
+        server_unreachable, auth_failed, session_expired, empty_mask.
+    Raises ValueError for bad prompt input (no point/box specified).
     """
     if "point_ijk" in prompt:
         seed = tuple(int(v) for v in prompt["point_ijk"])
@@ -124,23 +148,51 @@ def segment_from_prompt(ct: np.ndarray, affine: np.ndarray, prompt: dict, case_k
             tuple(max(a, b) + 1 for a, b in zip(c0, c1)),
         )
 
-    if USE_NNINTERACTIVE:
-        try:
-            from services.nninteractive_predictor import predict
-            mask = predict(
-                ct,
-                case_key or "unkeyed",
-                point_ijk=seed if box_ijk is None else None,
-                box_ijk=box_ijk,
-            )
-            if mask.sum() > 0:
-                return mask
-            print("[segment_from_prompt] nnInteractive returned empty mask, falling back to region_grow")
-        except Exception as e:
-            print(f"[segment_from_prompt] nnInteractive failed ({type(e).__name__}: {e}), falling back to region_grow")
+    # ── nnInteractive path ─────────────────────────────────────────────────
+    # Import lazily so the module loads even when nninteractive-client is absent.
+    try:
+        from nnInteractive.inference.remote.remote_session import (
+            SessionExpiredError,
+            ServerAtCapacityError,
+        )
+        import httpx
+    except ImportError as e:
+        raise SegmentError("server_unreachable", f"nninteractive-client not installed: {e}")
 
-    tolerance = min(max(float(prompt.get("tolerance", 80.0)), 1.0), 1000.0)
-    return region_grow(ct, seed, tolerance=tolerance, box_ijk=box_ijk)
+    try:
+        from services.nninteractive_predictor import predict
+        mask = predict(
+            ct,
+            case_key or "unkeyed",
+            point_ijk=seed if box_ijk is None else None,
+            box_ijk=box_ijk,
+        )
+    except SessionExpiredError as e:
+        # predict() already retried once; if we land here the session is gone.
+        raise SegmentError("session_expired", str(e))
+    except ServerAtCapacityError as e:
+        raise SegmentError("server_unreachable", str(e))
+    except httpx.HTTPStatusError as e:
+        status = e.response.status_code if e.response is not None else 0
+        if status in (401, 403):
+            raise SegmentError("auth_failed", f"HTTP {status} from nnInteractive server")
+        # 5xx, 530 (Cloudflare tunnel dead), and other HTTP errors
+        raise SegmentError("server_unreachable", f"HTTP {status} from nnInteractive server")
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as e:
+        raise SegmentError("server_unreachable", type(e).__name__)
+    except RuntimeError as e:
+        # _get_session() raises RuntimeError when ping() fails
+        raise SegmentError("server_unreachable", str(e))
+    except Exception as e:
+        # Catch-all for unexpected predictor errors — log and re-raise as unreachable
+        # so the frontend always gets a structured reason rather than a bare 500.
+        print(f"[segment_from_prompt] unexpected error: {type(e).__name__}: {e}")
+        raise SegmentError("server_unreachable", type(e).__name__)
+
+    if mask.sum() == 0:
+        raise SegmentError("empty_mask", "nnInteractive returned an empty mask")
+
+    return mask, "nninteractive"
 
 # --------------------------------------------------------------------------- #
 # 2. Vessel curved-planar analysis

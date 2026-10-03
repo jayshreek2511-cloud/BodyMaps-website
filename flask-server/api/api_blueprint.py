@@ -7497,20 +7497,24 @@ def _safe_case_id(case_id):
 
 
 def _case_ct_path(case_id, low=False):
-    case_dir = f"{Constants.PANTS_PATH}/image_only/{get_panTS_id(_safe_case_id(case_id))}"
-    path = f"{case_dir}/{Constants.MAIN_NIFTI_FILENAME}"
+    pants_id = get_panTS_id(_safe_case_id(case_id))
+    path = f"{Constants.PANTS_PATH}/image_only/{pants_id}/{Constants.MAIN_NIFTI_FILENAME}"
     if low:
-        low_path = path.replace('.nii.gz', '_lowres.nii.gz')
+        # Low-res volumes live under LOWRES_ROOT (writable disk), not the read-only
+        # PANTS_PATH — the same layout that get-main-nifti uses.
+        low_name = Constants.MAIN_NIFTI_FILENAME.replace('.nii.gz', '_lowres.nii.gz')
+        low_path = f"{LOWRES_ROOT}/image_only/{pants_id}/{low_name}"
         if os.path.exists(low_path):
             return low_path
     return path
 
 
 def _case_mask_path(case_id, low=False):
-    case_dir = f"{Constants.PANTS_PATH}/mask_only/{get_panTS_id(_safe_case_id(case_id))}"
-    path = f"{case_dir}/{Constants.COMBINED_LABELS_NIFTI_FILENAME}"
+    pants_id = get_panTS_id(_safe_case_id(case_id))
+    path = f"{Constants.PANTS_PATH}/mask_only/{pants_id}/{Constants.COMBINED_LABELS_NIFTI_FILENAME}"
     if low:
-        low_path = path.replace('.nii.gz', '_lowres.nii.gz')
+        low_name = Constants.COMBINED_LABELS_NIFTI_FILENAME.replace('.nii.gz', '_lowres.nii.gz')
+        low_path = f"{LOWRES_ROOT}/mask_only/{pants_id}/{low_name}"
         if os.path.exists(low_path):
             return low_path
     return path
@@ -7556,23 +7560,39 @@ def interactive_segment(case_id):
     Body JSON: { point_lps:[x,y,z] | point_ijk:[i,j,k], tolerance?, box_lps?,
                  res?: "low"|"full" }. res should match the resolution the viewer
                  loaded so the returned mask's voxel grid aligns with the labelmap.
+
+    Error responses always include {"error": "<message>", "reason": "<code>"} so the
+    frontend can show a targeted message without string-matching.
+    reason codes: server_unreachable, auth_failed, session_expired,
+                  empty_mask, resolution_mismatch.
     """
     if not _ANALYSIS_SLOTS.acquire(blocking=False):
         return jsonify(_ANALYSIS_BUSY_RESPONSE[0]), _ANALYSIS_BUSY_RESPONSE[1]
     try:
         import numpy as np
-        from services.advanced_analysis import segment_from_prompt
+        from services.advanced_analysis import segment_from_prompt, SegmentError
         body = request.get_json(force=True, silent=True) or {}
         low = (body.get("res") or "low").lower() == "low"
         ct_path = _case_ct_path(case_id, low=low)
         if not os.path.exists(ct_path):
-            return jsonify({"error": "CT not found for this case on the server."}), 404
+            return jsonify({"error": "CT not found for this case on the server.", "reason": "server_unreachable"}), 404
 
         case_key = f"{case_id}:{'low' if low else 'full'}"
         ct_obj, ct = _load_ct_cached(ct_path, case_key)
-        mask = segment_from_prompt(ct, ct_obj.affine, body, case_key=case_key)
-        if int(mask.sum()) == 0:
-            return jsonify({"error": "Nothing grew from that point — try a different spot or a higher tolerance."}), 422
+
+        try:
+            mask, engine = segment_from_prompt(ct, ct_obj.affine, body, case_key=case_key)
+        except SegmentError as se:
+            _REASON_STATUS = {
+                "server_unreachable": 503,
+                "auth_failed":        401,
+                "session_expired":    410,
+                "empty_mask":         422,
+                "resolution_mismatch": 409,
+            }
+            status = _REASON_STATUS.get(se.reason, 500)
+            print(f"[interactive_segment] SegmentError reason={se.reason}: {se.detail}")
+            return jsonify({"error": str(se), "reason": se.reason}), status
 
         out = nib.Nifti1Image(mask, ct_obj.affine, ct_obj.header)
         out.header.set_data_dtype('uint8')
@@ -7582,13 +7602,14 @@ def interactive_segment(case_id):
         resp = make_response(gz)
         resp.headers['Content-Type'] = 'application/gzip'
         resp.headers['X-Mask-Voxels'] = str(int(mask.sum()))
+        resp.headers['X-Engine-Used'] = engine
         resp.headers['Cross-Origin-Resource-Policy'] = 'cross-origin'
         return resp
     except ValueError as ve:
-        return jsonify({"error": str(ve)}), 400
+        return jsonify({"error": str(ve), "reason": "bad_request"}), 400
     except Exception as error:
         print("[interactive_segment error]", type(error).__name__, error)
-        return jsonify({"error": "Interactive segmentation failed."}), 500
+        return jsonify({"error": "Interactive segmentation failed.", "reason": "server_unreachable"}), 500
     finally:
         _ANALYSIS_SLOTS.release()
 

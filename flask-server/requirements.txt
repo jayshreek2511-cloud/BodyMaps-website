@@ -21,6 +21,9 @@ itsdangerous==2.2.0
 Jinja2==3.1.4
 Mako==1.3.8
 nibabel==5.2.1
+# Torch-free client for nnInteractive remote inference server.
+# The GPU/model side runs on a separate host (Colab or bdmap1).
+nninteractive-client==2.6.0
 numpy>=2.0
 openpyxl
 packaging==24.1
