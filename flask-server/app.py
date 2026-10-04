@@ -147,7 +147,7 @@ def create_app():
         ).split(",")
         if o.strip()
     ]
-    CORS(app, resources={r"/*": {"origins": allowed_origins}}, supports_credentials=True)
+    CORS(app, resources={r"/*": {"origins": allowed_origins, "expose_headers": ["X-Engine-Used"]}}, supports_credentials=True)
 
     return app
 

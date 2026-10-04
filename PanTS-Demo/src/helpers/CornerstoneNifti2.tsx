@@ -2169,7 +2169,7 @@ export async function submitInteractiveSegmentPrompt(
     } catch { /* non-JSON body — fall through to status-based message */ }
 
     const REASON_MESSAGES: Record<string, string> = {
-      server_unreachable: "Cannot reach the AI server. Check that the Colab server and tunnel are running.",
+      server_unreachable: "Cannot reach the AI server. Check that the GPU server and tunnel are running.",
       auth_failed:        "The AI server rejected the API key. Update the key in flask-server/.env and restart Flask.",
       session_expired:    "The AI session expired. Please click again.",
       empty_mask:         "AI found nothing at that point. Try clicking closer to the center of the organ.",
@@ -2181,7 +2181,15 @@ export async function submitInteractiveSegmentPrompt(
 
   // Read the engine header before consuming the body (headers are available
   // immediately; body is a stream that we drain below).
-  const engine = httpRes.headers.get("X-Engine-Used") ?? "unknown";
+  const engineHeader = httpRes.headers.get("X-Engine-Used");
+  if (httpRes.status === 200 && !engineHeader?.trim()) {
+    return {
+      changed: 0,
+      engine: "unknown",
+      blocked: "AI response was received but the engine could not be read. Please report this.",
+    };
+  }
+  const engine = engineHeader ?? "unknown";
 
   const gz = await httpRes.arrayBuffer();
   const niiBytes = await _decompressGzip(gz);
@@ -2223,7 +2231,7 @@ export async function submitInteractiveSegmentPrompt(
     return {
       changed: 0,
       engine,
-      blocked: "Cannot reach the AI server. Check that the Colab server and tunnel are running." as string | undefined,
+      blocked: "Cannot reach the AI server. Check that the GPU server and tunnel are running." as string | undefined,
     };
   }
 
