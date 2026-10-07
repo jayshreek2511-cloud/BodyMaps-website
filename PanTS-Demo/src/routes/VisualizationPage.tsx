@@ -897,6 +897,12 @@ function VisualizationPage({ liveRoom, soloChallenge, quizPractice }: Visualizat
 	const [editMode, setEditMode] = useState<MaskEditMode>(null);
 	const [brushPreviewActive, setBrushPreviewActive] = useState(false);
 	const [activeToolbarTool, setActiveToolbarTool] = useState<PrimaryEditTool>(null);
+	const promptPendingRef = useRef(false);
+	const logAiToolPaneEvent = (event: "onClick" | "onMouseDown" | "onMouseUp", pane: CinePane) => {
+		if (activeToolbarTool === "pointSegment" || activeToolbarTool === "boxSegment") {
+			console.log(`[ai-tool] pane=${pane} event=${event}`);
+		}
+	};
 	
 	
 	// Only paint/erase/scissors/growFromSeeds need the pane to behave differently
@@ -914,6 +920,7 @@ function VisualizationPage({ liveRoom, soloChallenge, quizPractice }: Visualizat
 
 	
 	const handleToolbarToolChange = (tool: PrimaryEditTool) => {
+		if (promptPendingRef.current) return;
 		if (!viewerReady || (tool && !hasActiveTarget)) return;
 		setActiveToolbarTool(tool);
 		setEditMode(tool ? TOOLBAR_TO_EDIT_MODE[tool] ?? null : null);
@@ -960,6 +967,7 @@ function VisualizationPage({ liveRoom, soloChallenge, quizPractice }: Visualizat
 
 	// map paint/erase/scissors toolbar selection onto the existing Cornerstone tool wiring
 	useEffect(() => {
+	console.log(`[ai-tool] activeToolbarTool=${activeToolbarTool ?? "none"}`);
 	if (activeToolbarTool === "paint" || activeToolbarTool === "erase") {
 		setActiveMeasurementTool(null);
 		setActiveMaskEditTool(activeToolbarTool === "paint" ? EDIT_BRUSH : EDIT_ERASER);
@@ -973,7 +981,7 @@ function VisualizationPage({ liveRoom, soloChallenge, quizPractice }: Visualizat
 	}
 	}, [activeToolbarTool]);
 
-	const setActiveSegment = (id: number | null) => setActiveSegmentState(id);
+	const setActiveSegment = (id: number | null) => { if (!promptPendingRef.current) setActiveSegmentState(id); };
 
 	// Shared by both "select a custom class" and "select an existing organ"
 	// (see onSelect/handleSelectCatalogOrgan below): moves both the 2D MPR
@@ -993,6 +1001,7 @@ function VisualizationPage({ liveRoom, soloChallenge, quizPractice }: Visualizat
 	// Selecting an existing organ from the dropdown targets the brush at it
 	// exactly like clicking a custom-segment row does.
 	const handleSelectCatalogOrgan = (id: number | null) => {
+		if (promptPendingRef.current) return;
 		setActiveCatalogOrganId(id);
 		// Keep activeSegment in lockstep in both directions — deselecting
 		// (id === null) must clear activeSegment too, or a stale id lingers
@@ -1407,6 +1416,7 @@ function VisualizationPage({ liveRoom, soloChallenge, quizPractice }: Visualizat
 	// for the last committed edit. Redo has no equivalent concept for an
 	// in-progress draw, so it's untouched.
 	const handleUndo = useCallback(() => {
+		if (promptPendingRef.current) return;
 		if (activeDrawTool.anchorsCanvas.length > 0) {
 			activeDrawTool.undo();
 			return;
@@ -1459,6 +1469,8 @@ function VisualizationPage({ liveRoom, soloChallenge, quizPractice }: Visualizat
 		onBusyChange: setPromptToolBusy,
 		onComplete: () => setActiveToolbarTool(null),
 	});
+	const activePendingPrompt = pointSegment.pending ? pointSegment : boxSegment.pending ? boxSegment : null;
+	promptPendingRef.current = Boolean(activePendingPrompt);
 
 	const enhanceStartedRef = useRef(false);
 	// Live mirrors so the async swap re-applies the *current* window/visibility, not
@@ -3355,7 +3367,7 @@ function VisualizationPage({ liveRoom, soloChallenge, quizPractice }: Visualizat
 	// (see the effect above), since painting before the full-res
 	// segmentation volume exists would edit a mask on the wrong grid.
 	const handleAnnotateClick = () => {
-		if (collaborationDisabled) return;
+		if (collaborationDisabled || promptPendingRef.current) return;
 		const hdReadyNow = isHd || enhance.state === "done";
 		if (hdReadyNow) {
 			handleToggleAnnotationToolbar();
@@ -3366,6 +3378,7 @@ function VisualizationPage({ liveRoom, soloChallenge, quizPractice }: Visualizat
 	};
 
 	const handleToggleAnnotationToolbar = () => {
+		if (promptPendingRef.current) return;
 		const opening = !showAnnotationToolbar;
 		setShowAnnotationToolbar(opening);
 		if (!opening) {
@@ -3395,6 +3408,7 @@ function VisualizationPage({ liveRoom, soloChallenge, quizPractice }: Visualizat
 	// the closing branch of handleToggleAnnotationToolbar exactly, just
 	// gated on "was it open" instead of always toggling.
 	const closeAnnotationToolbarIfOpen = () => {
+		if (promptPendingRef.current) return;
 		if (!showAnnotationToolbar) return;
 		setShowAnnotationToolbar(false);
 		setActiveCatalogOrganId(null);
@@ -4141,20 +4155,20 @@ const aiAvailableOrgans = useMemo(() => {
 											    Wrapped in undoRedoGroupRef so clicking either button never closes
 											    an already-open annotation ribbon (see the topbar's onClick above) —
 											    undo/redo history is independent of ribbon visibility. */}
-											<div ref={undoRedoGroupRef} style={{ display: "contents" }}>
-												<button
-													className="vp-tool"
-												onClick={() => liveRoom ? liveRoom.requestUndo() : handleUndo()}
-												disabled={collaborationDisabled}
+							<div ref={undoRedoGroupRef} style={{ display: "contents" }}>
+								<button
+									className="vp-tool"
+									onClick={() => liveRoom ? liveRoom.requestUndo() : handleUndo()}
+									disabled={collaborationDisabled || Boolean(activePendingPrompt)}
 													aria-label="Undo"
 												>
 													<IconArrowBackUp size={20} color="white" />
 													<span className="vp-tool__tip">Undo (⌘Z) — measurements & mask edits</span>
-												</button>
-												<button
-													className="vp-tool"
-													onClick={() => redoMaskEdit()}
-													disabled={Boolean(liveRoom)}
+				</button>
+				<button
+					className="vp-tool"
+					onClick={() => redoMaskEdit()}
+					disabled={Boolean(liveRoom) || Boolean(activePendingPrompt)}
 													aria-label="Redo"
 												>
 													<IconArrowForwardUp size={20} color="white" />
@@ -4171,7 +4185,7 @@ const aiAvailableOrgans = useMemo(() => {
 												// loading overlay; the toolbar only opens once that
 												// finishes (see handleAnnotateClick / annotateHdLoading).
 													const hdReady = isHd || enhance.state === "done";
-													const annotationDisabled = collaborationDisabled;
+								const annotationDisabled = collaborationDisabled || Boolean(activePendingPrompt);
 												return (
 													<button
 														ref={annotatePencilRef}
@@ -4507,27 +4521,28 @@ const aiAvailableOrgans = useMemo(() => {
 					<div
 						className="vp-pane-wrap"
 						style={{ ...panelStyle("axial"), ...paneGridStyle("axial") }}
-						onMouseUp={(e) => { smartFill.handleMouseUp(); boxSegment.handleMouseUp("axial")(e); }}>
+							onMouseUp={(e) => { logAiToolPaneEvent("onMouseUp", "axial"); smartFill.handleMouseUp(); }}>
 						<div
 							className={`axial ${loading ? "" : "vp-pane vp-pane--axial"}${hoverIdentifyEnabled ? " vp-pane--hover-identify" : ""}${editMode === "smartfill" || morphPicker.picking ? " vp-pane--edit-cursor" : ""}`}
 							data-label="Axial"
 							ref={axial_ref}
-							onClick={(e) => { handleMouseClick(e); pointSegment.handleClick("axial")(e); }}
+							onPointerDown={boxSegment.handlePointerDown("axial")}
+							onPointerMove={boxSegment.handlePointerMove("axial")}
+							onClick={(e) => { logAiToolPaneEvent("onClick", "axial"); handleMouseClick(e); pointSegment.handleClick("axial")(e); }}
 							onDoubleClick={activeDrawTool.handleDoubleClick("axial")}
 							onMouseDown={(e) => {
+								logAiToolPaneEvent("onMouseDown", "axial");
 								focusedPane.handleMouseDown("axial")();
 								smartFill.handleMouseDown("axial")(e);
 								morphPicker.handlePaneClick("axial")(e);
 								activeDrawTool.handleClick("axial")(e);
 								levelTracing.handleClick("axial")(e);
-								boxSegment.handleMouseDown("axial")(e);
 							}}
 							onMouseMove={(e) => {
 								handlePaneHover("axial")(e);
 								smartFill.handleMouseMove("axial")(e);
 								activeDrawTool.handleMouseMove("axial")(e);
 								levelTracing.handleMouseMove("axial")(e);
-								boxSegment.handleMouseMove("axial")(e);
 							}}
 							onMouseLeave={handlePaneHoverLeave("axial")}
 							onWheel={focusedPane.handleWheel("axial")}
@@ -4590,27 +4605,28 @@ const aiAvailableOrgans = useMemo(() => {
 					<div
 						className="vp-pane-wrap"
 						style={{ ...panelStyle("sagittal"), ...paneGridStyle("sagittal") }}
-						onMouseUp={(e) => { smartFill.handleMouseUp(); boxSegment.handleMouseUp("sagittal")(e); }}>
+							onMouseUp={(e) => { logAiToolPaneEvent("onMouseUp", "sagittal"); smartFill.handleMouseUp(); }}>
 					<div
 						className={`sagittal ${loading ? "" : "vp-pane vp-pane--sagittal"}${hoverIdentifyEnabled ? " vp-pane--hover-identify" : ""}${editMode === "smartfill" || morphPicker.picking ? " vp-pane--edit-cursor" : ""}`}
 						data-label="Sagittal"
 						ref={sagittal_ref}
-						onClick={(e) => { handleMouseClick(e); pointSegment.handleClick("sagittal")(e); }}
+						onPointerDown={boxSegment.handlePointerDown("sagittal")}
+						onPointerMove={boxSegment.handlePointerMove("sagittal")}
+						onClick={(e) => { logAiToolPaneEvent("onClick", "sagittal"); handleMouseClick(e); pointSegment.handleClick("sagittal")(e); }}
 						onDoubleClick={activeDrawTool.handleDoubleClick("sagittal")}
 						onMouseDown={(e) => {
+							logAiToolPaneEvent("onMouseDown", "sagittal");
 							focusedPane.handleMouseDown("sagittal")();
 							smartFill.handleMouseDown("sagittal")(e);
 							morphPicker.handlePaneClick("sagittal")(e);
 							activeDrawTool.handleClick("sagittal")(e);
 							levelTracing.handleClick("sagittal")(e);
-							boxSegment.handleMouseDown("sagittal")(e);
 						}}
 						onMouseMove={(e) => {
 							handlePaneHover("sagittal")(e);
 							smartFill.handleMouseMove("sagittal")(e);
 							activeDrawTool.handleMouseMove("sagittal")(e);
 							levelTracing.handleMouseMove("sagittal")(e);
-							boxSegment.handleMouseMove("sagittal")(e);
 						}}
 						onMouseLeave={handlePaneHoverLeave("sagittal")}
 						onWheel={focusedPane.handleWheel("sagittal")}
@@ -4674,20 +4690,22 @@ const aiAvailableOrgans = useMemo(() => {
 					<div
 						className="vp-pane-wrap"
 						style={{ ...panelStyle("coronal"), ...paneGridStyle("coronal") }}
-						onMouseUp={(e) => { smartFill.handleMouseUp(); boxSegment.handleMouseUp("coronal")(e); }}>
+						onMouseUp={(e) => { logAiToolPaneEvent("onMouseUp", "coronal"); smartFill.handleMouseUp(); }}>
 					<div
 						className={`coronal ${loading ? "" : "vp-pane vp-pane--coronal"}${hoverIdentifyEnabled ? " vp-pane--hover-identify" : ""}${editMode === "smartfill" || morphPicker.picking ? " vp-pane--edit-cursor" : ""}`}
 						data-label="Coronal"
 						ref={coronal_ref}
-						onClick={(e) => { handleMouseClick(e); pointSegment.handleClick("coronal")(e); }}
+						onPointerDown={boxSegment.handlePointerDown("coronal")}
+						onPointerMove={boxSegment.handlePointerMove("coronal")}
+						onClick={(e) => { logAiToolPaneEvent("onClick", "coronal"); handleMouseClick(e); pointSegment.handleClick("coronal")(e); }}
 						onDoubleClick={activeDrawTool.handleDoubleClick("coronal")}
 						onMouseDown={(e) => {
+							logAiToolPaneEvent("onMouseDown", "coronal");
 							focusedPane.handleMouseDown("coronal")();
 							smartFill.handleMouseDown("coronal")(e);
 							morphPicker.handlePaneClick("coronal")(e);
 							activeDrawTool.handleClick("coronal")(e);
 							levelTracing.handleClick("coronal")(e);
-							boxSegment.handleMouseDown("coronal")(e);
 
 
 						}}
@@ -4696,7 +4714,6 @@ const aiAvailableOrgans = useMemo(() => {
 							smartFill.handleMouseMove("coronal")(e);
 							activeDrawTool.handleMouseMove("coronal")(e);
 							levelTracing.handleMouseMove("coronal")(e);
-							boxSegment.handleMouseMove("coronal")(e);
 						}}
 						onMouseLeave={handlePaneHoverLeave("coronal")}
 						onWheel={focusedPane.handleWheel("coronal")}
@@ -5139,6 +5156,13 @@ const aiAvailableOrgans = useMemo(() => {
 					/>
 				);
 			})()}
+			{activePendingPrompt?.pending && (
+				<div role="group" aria-label="AI preview confirmation" style={{ position: "fixed", zIndex: 1200, left: "50%", bottom: 24, transform: "translateX(-50%)", display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 10, background: "var(--vp-panel-bg, #17191f)", border: "1px solid var(--vp-border, #3a3d46)", boxShadow: "0 8px 28px rgba(0,0,0,.35)", color: "white" }}>
+					<span>AI preview: {activePendingPrompt.pending.voxelCount.toLocaleString()} voxels (nnInteractive)</span>
+					<button className="vp-tool" onClick={activePendingPrompt.accept}>Accept</button>
+					<button className="vp-tool" onClick={activePendingPrompt.reject}>Reject</button>
+				</div>
+			)}
 			<SegmentsPopup
 				open={showAnnotationToolbar}
 				segments={customOrgans}
@@ -5146,6 +5170,7 @@ const aiAvailableOrgans = useMemo(() => {
 				visibility={segmentVisibility}
 				activeSegmentId={activeSegment}
 				onSelect={(id) => {
+					if (promptPendingRef.current) return;
 					setActiveSegment(id);
 					setActiveCatalogOrganId(null);
 					if (id != null) jumpCrosshairToSegmentCentroid(id);

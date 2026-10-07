@@ -2107,6 +2107,52 @@ export interface InteractivePrompt {
   tolerance?: number;
 }
 
+export interface PendingPromptHandle {
+  touchedIdx: number[];
+  priorValues: number[];
+  segmentIndex: number;
+  voxelCount: number;
+  engine: string;
+  volume: any;
+  settled: boolean;
+}
+
+let _pendingPrompt: PendingPromptHandle | null = null;
+
+export function acceptPendingPrompt(handle: PendingPromptHandle): void {
+  if (handle.settled || _pendingPrompt !== handle) return;
+  handle.settled = true;
+  const applyAndRefresh = (values: number[]) => {
+    const volume = cache.getVolume(segmentationId);
+    if (!volume || volume !== handle.volume) return;
+    const scalars = (volume as any)?.voxelManager?.getCompleteScalarDataArray?.() ?? (volume as any)?.scalarData;
+    if (!scalars) return;
+    handle.touchedIdx.forEach((idx, i) => { scalars[idx] = values[i]; });
+    (volume as any)?.voxelManager?.setCompleteScalarDataArray?.(scalars);
+    _notifySegmentationChanged();
+  };
+  pushEditHistory({
+    undo: () => applyAndRefresh(handle.priorValues),
+    redo: () => applyAndRefresh(handle.touchedIdx.map(() => handle.segmentIndex)),
+  });
+  _pendingPrompt = null;
+}
+
+export function rejectPendingPrompt(handle: PendingPromptHandle): void {
+  if (handle.settled || _pendingPrompt !== handle) return;
+  handle.settled = true;
+  const volume = cache.getVolume(segmentationId);
+  if (volume && volume === handle.volume) {
+    const scalars = (volume as any)?.voxelManager?.getCompleteScalarDataArray?.() ?? (volume as any)?.scalarData;
+    if (scalars) {
+      handle.touchedIdx.forEach((idx, i) => { scalars[idx] = handle.priorValues[i]; });
+      (volume as any)?.voxelManager?.setCompleteScalarDataArray?.(scalars);
+      _notifySegmentationChanged();
+    }
+  }
+  _pendingPrompt = null;
+}
+
 async function _decompressGzip(buf: ArrayBuffer): Promise<ArrayBuffer> {
   // Prefer the native DecompressionStream (Chrome/Edge/Safari 16.4+); if it's
   // unavailable, this throws and the caller should show "unsupported browser"
@@ -2136,9 +2182,13 @@ export async function submitInteractiveSegmentPrompt(
   activeSegmentIndex: number,
   prompt: InteractivePrompt,
   res: "low" | "full",
-): Promise<{ changed: number; engine: string; blocked?: string }> {
+): Promise<{ changed: number; engine: string; blocked?: string; pending?: PendingPromptHandle }> {
+  console.log(`[ai-tool] submitInteractiveSegmentPrompt start res=${res}`);
   const segVolume = cache.getVolume(segmentationId);
-  if (!segVolume) throw new Error("No segmentation loaded for this case.");
+  if (!segVolume) {
+    console.log("[ai-tool] submitInteractiveSegmentPrompt returned early reason=no segmentation volume");
+    throw new Error("No segmentation loaded for this case.");
+  }
 
   const body: Record<string, unknown> = {
     point_lps: [prompt.pointLps[0], prompt.pointLps[1], prompt.pointLps[2]],
@@ -2152,11 +2202,17 @@ export async function submitInteractiveSegmentPrompt(
   }
   if (prompt.tolerance != null) body.tolerance = prompt.tolerance;
 
-  const httpRes = await fetch(`${apiBase}/api/interactive-segment/${caseId}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  let httpRes: Response;
+  try {
+    httpRes = await fetch(`${apiBase}/api/interactive-segment/${caseId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    console.log(`[ai-tool] response unavailable error=${error instanceof Error ? error.name : "unknown"}`);
+    throw error;
+  }
   if (!httpRes.ok) {
     // The backend always returns {"error": "...", "reason": "<code>"} for failures.
     // Map each reason code to a clear, actionable message for the user.
@@ -2167,6 +2223,7 @@ export async function submitInteractiveSegmentPrompt(
       reason = j?.reason ?? "";
       serverMsg = j?.error ?? "";
     } catch { /* non-JSON body — fall through to status-based message */ }
+    console.log(`[ai-tool] response status=${httpRes.status} reason=${reason || "none"}`);
 
     const REASON_MESSAGES: Record<string, string> = {
       server_unreachable: "Cannot reach the AI server. Check that the GPU server and tunnel are running.",
@@ -2178,6 +2235,7 @@ export async function submitInteractiveSegmentPrompt(
     const msg = REASON_MESSAGES[reason] ?? serverMsg ?? `Interactive segmentation failed (${httpRes.status}).`;
     throw new Error(msg);
   }
+  console.log(`[ai-tool] response status=${httpRes.status} reason=none`);
 
   // Read the engine header before consuming the body (headers are available
   // immediately; body is a stream that we drain below).
@@ -2279,22 +2337,13 @@ export async function submitInteractiveSegmentPrompt(
     // doesn't disturb camera position/zoom the way rebuilding did.
     _notifySegmentationChanged();
 
-    // Own undo/redo entry, same shared stack as smart fill / scissors /
-    // lasso (pushEditHistory below) — a SEPARATE stack from brush strokes
-    // (Cornerstone's own HistoryMemo), so undoing a point/box segment never
-    // also reverts (or gets shadowed by) an unrelated brush stroke; see
-    // undoMaskEdit's recency check for how the two stacks interleave.
     if (touchedIdx.length > 0) {
-      const applyAndRefresh = (values: number[]) => {
-        touchedIdx.forEach((idx, i) => { segScalars[idx] = values[i]; });
-        (segVolume as any)?.voxelManager?.setCompleteScalarDataArray?.(segScalars);
-        _notifySegmentationChanged();
+      const pending: PendingPromptHandle = {
+        touchedIdx, priorValues, segmentIndex: activeSegmentIndex,
+        voxelCount: changed, engine, volume: segVolume, settled: false,
       };
-      const redoValues = touchedIdx.map(() => activeSegmentIndex);
-      pushEditHistory({
-        undo: () => applyAndRefresh(priorValues),
-        redo: () => applyAndRefresh(redoValues),
-      });
+      _pendingPrompt = pending;
+      return { changed, engine, blocked: undefined, pending };
     }
   }
 

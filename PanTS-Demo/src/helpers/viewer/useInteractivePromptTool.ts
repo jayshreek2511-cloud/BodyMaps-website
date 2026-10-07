@@ -5,11 +5,14 @@
 // simpler point/box prompt gesture: a single click submits immediately in
 // "point" mode; a click-drag defines two corners and submits on mouseup in
 // "box" mode.
-import { useCallback, useEffect, useRef, useState, type MouseEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import {
 	canvasPointToWorld,
 	worldToCanvasPoint,
 	submitInteractiveSegmentPrompt,
+	acceptPendingPrompt,
+	rejectPendingPrompt,
+	type PendingPromptHandle,
 	type CinePane,
 } from "../CornerstoneNifti2";
 // Avoid importing Point3 from "@cornerstonejs/core/types" directly — Vite's
@@ -53,6 +56,8 @@ export function useInteractivePromptTool({
 	const [dragStartWorld, setDragStartWorld] = useState<Point3 | null>(null);
 	const [liveBoxCanvas, setLiveBoxCanvas] = useState<[[number, number], [number, number]] | null>(null);
 	const paneRef = useRef<CinePane | null>(null);
+	const paneElementRef = useRef<HTMLElement | null>(null);
+	const pointerIdRef = useRef<number | null>(null);
 	const busyRef = useRef(false);
 	// Drives the applying/success overlay (mirrors CopyAcrossSlicesFlyout's
 	// GuidedStepModal pattern) instead of the tool silently completing with
@@ -60,22 +65,35 @@ export function useInteractivePromptTool({
 	// trip (hundreds of ms to a few seconds), so it needs its own feedback,
 	// not just whatever "Interactive segment (N vox)" text happens to scroll
 	// past in the log panel.
-	const [status, setStatus] = useState<"idle" | "applying" | "success" | "error">("idle");
+	const [status, setStatus] = useState<"idle" | "applying" | "success" | "error" | "pending">("idle");
 	const [statusMessage, setStatusMessage] = useState<string | null>(null);
+	const [pending, setPending] = useState<PendingPromptHandle | null>(null);
+	useEffect(() => {
+		console.log(`[ai-tool] ${mode} enabled=${enabled}`);
+	}, [enabled, mode]);
 
 	const reset = useCallback(() => {
 		setDragStartCanvas(null);
 		setDragStartWorld(null);
 		setLiveBoxCanvas(null);
 		paneRef.current = null;
+		paneElementRef.current = null;
+		pointerIdRef.current = null;
 	}, []);
 
-	const submit = useCallback(async (_pane: CinePane, pointWorld: Point3, boxWorld?: [Point3, Point3]) => {		if (busyRef.current) return; // one in-flight request at a time
+	const submit = useCallback(async (_pane: CinePane, pointWorld: Point3, boxWorld?: [Point3, Point3]) => {
+		console.log("[ai-tool] submit called");
+		if (busyRef.current) {
+			console.log("[ai-tool] submit returned early reason=busy");
+			return;
+		} // one in-flight request at a time
 		if (activeSegmentIndex == null) {
+			console.log("[ai-tool] submit returned early reason=no target segment");
 			onLog?.("Interactive segment: no target segment selected.");
 			return;
 		}
 		if (caseId == null) {
+			console.log("[ai-tool] submit returned early reason=no caseId");
 			onLog?.("Interactive segment: no case loaded.");
 			return;
 		}
@@ -84,7 +102,7 @@ export function useInteractivePromptTool({
 		setStatus("applying");
 		setStatusMessage(null);
 		try {
-			const { changed, engine, blocked } = await submitInteractiveSegmentPrompt(
+			const { changed, engine, blocked, pending: pendingHandle } = await submitInteractiveSegmentPrompt(
 				apiBase,
 				caseId,
 				activeSegmentIndex,
@@ -97,13 +115,17 @@ export function useInteractivePromptTool({
 				setStatus("error");
 				setStatusMessage(blocked);
 			} else if (changed) {
-				const engineLabel = engine === "nninteractive"
-					? "AI (nnInteractive)"
-					: "fallback (nnInteractive unavailable)";
-				const msg = `Applied via ${engineLabel} — ${changed.toLocaleString()} voxels changed`;
-				onLog?.(msg);
-				setStatus("success");
-				setStatusMessage(msg);
+				if (pendingHandle) {
+					setPending(pendingHandle);
+					setStatus("pending");
+					setStatusMessage(null);
+				} else {
+					const engineLabel = engine === "nninteractive" ? "AI (nnInteractive)" : "fallback (nnInteractive unavailable)";
+					const msg = `Applied via ${engineLabel} — ${changed.toLocaleString()} voxels changed`;
+					onLog?.(msg);
+					setStatus("success");
+					setStatusMessage(msg);
+				}
 				onComplete?.();
 			} else {
 				const msg = "Interactive segment: nothing grew from that point — try a different spot.";
@@ -112,6 +134,7 @@ export function useInteractivePromptTool({
 				setStatusMessage(msg);
 			}
 		} catch (e) {
+			console.log(`[ai-tool] submit failed error=${e instanceof Error ? e.name : "unknown"}`);
 			const msg = e instanceof Error ? e.message : "Interactive segmentation failed.";
 			onLog?.(msg);
 			setStatus("error");
@@ -127,92 +150,117 @@ export function useInteractivePromptTool({
 		setStatusMessage(null);
 	}, []);
 
+	const accept = useCallback(() => {
+		if (!pending) return;
+		acceptPendingPrompt(pending);
+		setPending(null);
+		setStatus("idle");
+	}, [pending]);
+	const reject = useCallback(() => {
+		if (!pending) return;
+		rejectPendingPrompt(pending);
+		setPending(null);
+		setStatus("idle");
+	}, [pending]);
+
+	useEffect(() => {
+		if (!pending) return;
+		const onKeyDown = (event: KeyboardEvent) => {
+			if (event.key === "Enter") { event.preventDefault(); event.stopImmediatePropagation(); accept(); }
+			else if (event.key === "Escape") { event.preventDefault(); event.stopImmediatePropagation(); reject(); }
+			else { event.preventDefault(); event.stopImmediatePropagation(); }
+		};
+		window.addEventListener("keydown", onKeyDown, true);
+		return () => window.removeEventListener("keydown", onKeyDown, true);
+	}, [pending, accept, reject]);
+
+	useEffect(() => {
+		if (!pending) return;
+		return () => rejectPendingPrompt(pending);
+	}, [caseId, pending]);
+
 	const handleClick = (pane: CinePane) => (e: MouseEvent) => {
-		if (!enabled || mode !== "point") return;
+		if (!enabled || mode !== "point") {
+			if (mode === "point" && busyRef.current) console.log("[ai-tool] point click ignored reason=busy");
+			return;
+		}
 		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
 		const canvasPos: [number, number] = [e.clientX - rect.left, e.clientY - rect.top];
 		const world = canvasPointToWorld(pane, canvasPos);
-		if (!world) return;
+		if (!world) {
+			console.log("[ai-tool] point click returned early reason=no world point");
+			return;
+		}
 		void submit(pane, world);
 	};
 
-	// Box mode: mousedown starts the drag, mousemove updates the live preview
-	// rectangle, mouseup submits both corners. Mirrors the pointer semantics a
+	// Box mode: pointerdown starts the drag, pointermove updates the live preview
+	// rectangle, pointerup submits both corners. Mirrors the pointer semantics a
 	// user already expects from the scissors' click-drag box operations.
-	const handleMouseDown = (pane: CinePane) => (e: MouseEvent) => {
-		if (!enabled || mode !== "box") return;
+	const handlePointerDown = (pane: CinePane) => (e: ReactPointerEvent) => {
+		if (!enabled || mode !== "box") {
+			if (mode === "box" && busyRef.current) console.log("[ai-tool] box mousedown ignored reason=busy");
+			return;
+		}
 		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
 		const canvasPos: [number, number] = [e.clientX - rect.left, e.clientY - rect.top];
 		const world = canvasPointToWorld(pane, canvasPos);
-		if (!world) return;
+		if (!world) {
+			console.log("[ai-tool] box mousedown returned early reason=no world point");
+			return;
+		}
+		e.preventDefault();
+		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
 		paneRef.current = pane;
+		paneElementRef.current = e.currentTarget as HTMLElement;
+		pointerIdRef.current = e.pointerId;
 		setDragStartCanvas(canvasPos);
 		setDragStartWorld(world);
 		setLiveBoxCanvas([canvasPos, canvasPos]);
 	};
 
-	const handleMouseMove = (pane: CinePane) => (e: MouseEvent) => {
+	const handlePointerMove = (pane: CinePane) => (e: ReactPointerEvent) => {
 		if (!enabled || mode !== "box" || paneRef.current !== pane || !dragStartCanvas) return;
 		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
 		const canvasPos: [number, number] = [e.clientX - rect.left, e.clientY - rect.top];
 		setLiveBoxCanvas([dragStartCanvas, canvasPos]);
 	};
 
-	const handleMouseUp = (pane: CinePane) => (e: MouseEvent) => {
-		if (!enabled || mode !== "box" || paneRef.current !== pane || !dragStartWorld) return;
-		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-		const canvasPos: [number, number] = [e.clientX - rect.left, e.clientY - rect.top];
-		const endWorld = canvasPointToWorld(pane, canvasPos);
-		const startWorld = dragStartWorld;
-		reset();
-		if (!endWorld) return;
-		// A click with ~no drag is treated as a degenerate box — submit as a
-		// point at the start position instead of an empty/near-empty box,
-		// which the backend's region_grow would otherwise clamp to nothing.
-		const dx = Math.abs(canvasPos[0] - (dragStartCanvas?.[0] ?? 0));
-		const dy = Math.abs(canvasPos[1] - (dragStartCanvas?.[1] ?? 0));
-		if (dx < 4 && dy < 4) {
-			void submit(pane, startWorld);
-		} else {
-			void submit(pane, startWorld, [startWorld, endWorld]);
-		}
-	};
-
-	// While a box drag is in progress, listen for pointerup and Escape on the
-	// window so the drag always completes (or cancels) even if the pointer
-	// leaves the pane div before the user releases.
+	// Pointer capture keeps drag events on the active pane; the window listener
+	// finishes the gesture once, even if the pointer leaves that pane.
 	useEffect(() => {
 		if (mode !== "box" || !dragStartWorld || !dragStartCanvas) return;
 
 		const onPointerUp = (e: PointerEvent) => {
+			if (pointerIdRef.current !== e.pointerId) return;
 			const startWorld = dragStartWorld;
 			const startCanvas = dragStartCanvas;
-			// Compute end canvas position relative to the active pane element.
-			// The pane divs in VisualizationPage use class names matching the
-			// pane id: "axial", "sagittal", "coronal".
-			// Fall back to startCanvas if not found (submits as a point).
+			// Use the same pane element for both corners so their canvas positions
+			// are in the same coordinate system.
 			let endCanvasPos: [number, number] = startCanvas;
-			if (paneRef.current) {
-				const paneEl = document.querySelector(
-					`.${paneRef.current}`
-				) as HTMLElement | null;
-				if (paneEl) {
-					const rect = paneEl.getBoundingClientRect();
-					endCanvasPos = [e.clientX - rect.left, e.clientY - rect.top];
-				}
+			const paneEl = paneElementRef.current;
+			if (paneEl) {
+				const rect = paneEl.getBoundingClientRect();
+				endCanvasPos = [e.clientX - rect.left, e.clientY - rect.top];
 			}
 			const currentPane = paneRef.current;
 			reset();
-			if (!currentPane) return;
+			if (!currentPane) {
+				console.log("[ai-tool] box pointerup returned early reason=no pane");
+				return;
+			}
 			const endWorld = canvasPointToWorld(currentPane, endCanvasPos);
-			if (!endWorld) return;
+			if (!endWorld) {
+				console.log("[ai-tool] box pointerup returned early reason=no end world point");
+				return;
+			}
 			const dx = Math.abs(endCanvasPos[0] - startCanvas[0]);
 			const dy = Math.abs(endCanvasPos[1] - startCanvas[1]);
 			if (dx < 4 && dy < 4) {
-				void submit(currentPane, startWorld);
-			} else {
-				void submit(currentPane, startWorld, [startWorld, endWorld]);
+				console.log("[ai-tool] box pointerup ignored reason=no box drag");
+				return;
 			}
+			void submit(currentPane, startWorld, [startWorld, endWorld]);
 		};
 
 		const onKeyDown = (e: KeyboardEvent) => {
@@ -242,11 +290,13 @@ export function useInteractivePromptTool({
 		liveBox: liveBoxDisplay,
 		status,
 		statusMessage,
+		pending,
+		accept,
+		reject,
 		dismissStatus,
 		handleClick,
-		handleMouseDown,
-		handleMouseMove,
-		handleMouseUp,
+		handlePointerDown,
+		handlePointerMove,
 		cancel: reset,
 		reset,
 	};
