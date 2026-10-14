@@ -15,6 +15,8 @@ import {
 	IconCircleDashed,
 	IconClick,
 	IconBoxModel2,
+	IconLasso,
+	IconPencil,
 } from "@tabler/icons-react";
 import "./AnnotationToolbar.css";
 import NumberSliderField from "../NumberSliderField";
@@ -36,7 +38,7 @@ export type PrimaryEditTool =
 	| "paint" | "erase" | "scissors" | "levelTracing"
 	| "margin" | "smoothing" | "islands" | "logicalOperators"
 	| "growFromSeeds" | "fillBetweenSlices" | "copyAcrossSlices" | "hollow"
-	| "pointSegment" | "boxSegment"
+	| "pointSegment" | "boxSegment" | "lassoSegment" | "scribbleSegment"
 	| null;
 export type ScissorsOperation = "eraseInside" | "eraseOutside" | "fillInside" | "fillOutside";
 export type ScissorsSliceCut = "unlimited" | "positive" | "negative" | "symmetric";
@@ -114,6 +116,8 @@ const TOOL_DEFS: Array<{ id: Exclude<PrimaryEditTool, null>; label: string; Icon
 	{ id: "hollow", label: "Hollow", Icon: IconCircleDashed, description: "Make the class hollow by replacing it with a uniform-thickness shell." },
 	{ id: "pointSegment", label: "AI Point Segment", Icon: IconClick, description: "Click a point to propose an AI segmentation for the active class." },
 	{ id: "boxSegment", label: "AI Box Segment", Icon: IconBoxModel2, description: "Draw a 2D bounding box to propose an AI segmentation for the active class." },
+	{ id: "lassoSegment", label: "AI Lasso Segment", Icon: IconLasso, description: "Draw a 2D lasso prompt for the active class." },
+	{ id: "scribbleSegment", label: "AI Scribble Segment", Icon: IconPencil, description: "Draw a 2D scribble prompt for the active class." },
 ];
 
 const SCISSORS_OPERATIONS: { value: ScissorsOperation; label: string }[] = [
@@ -125,7 +129,7 @@ const SCISSORS_OPERATIONS: { value: ScissorsOperation; label: string }[] = [
 
 // Tools that don't have an ApplyButton — they commit directly on pointer
 // interaction, so the rendering dot is the only feedback available.
-const LIVE_COMMIT_TOOLS: Exclude<PrimaryEditTool, null>[] = ["paint", "erase", "scissors", "levelTracing", "pointSegment", "boxSegment"];
+const LIVE_COMMIT_TOOLS: Exclude<PrimaryEditTool, null>[] = ["paint", "erase", "scissors", "levelTracing", "pointSegment", "boxSegment", "lassoSegment", "scribbleSegment"];
 
 const MIN_DIAMETER_MM = 2;
 const MAX_DIAMETER_MM = 40;
@@ -780,7 +784,7 @@ export default function AnnotationToolbar({
 					// Only equip-and-use tools (paint/erase/scissors/level tracing)
 					// get a settings arrow; other tools open settings on icon click.
 					const hasSettingsArrow =
-						LIVE_COMMIT_TOOLS.includes(id) && id !== "pointSegment" && id !== "boxSegment";
+						LIVE_COMMIT_TOOLS.includes(id) && !["pointSegment", "boxSegment", "lassoSegment", "scribbleSegment"].includes(id);
 					const settingsOpenHere = toolFlyout.open && activeTool === id;
 					return (
 						<div
@@ -999,7 +1003,7 @@ export default function AnnotationToolbar({
 											onCloseSettings={() => toolFlyout.setOpen(false)}
 										/>
 									)}
-									{activeTool && !["paint", "erase", "scissors", "pointSegment", "boxSegment"].includes(activeTool) && renderFlyout(activeTool, handleToolApplied, () => toolFlyout.setOpen(false), setGuidedControls)}
+					{activeTool && !["paint", "erase", "scissors", "pointSegment", "boxSegment", "lassoSegment", "scribbleSegment"].includes(activeTool) && renderFlyout(activeTool, handleToolApplied, () => toolFlyout.setOpen(false), setGuidedControls)}
 								</div>
 							</div>
 						</div>

@@ -132,6 +132,7 @@ def segment_from_prompt(
         server_unreachable, auth_failed, session_expired, empty_mask.
     Raises ValueError for bad prompt input (no point/box specified).
     """
+    prompt_mode = prompt.get("prompt_mode", "box" if prompt.get("box_lps") else "point")
     if "point_ijk" in prompt:
         seed = tuple(int(v) for v in prompt["point_ijk"])
     elif "point_lps" in prompt:
@@ -147,6 +148,42 @@ def segment_from_prompt(
             tuple(min(a, b) for a, b in zip(c0, c1)),
             tuple(max(a, b) + 1 for a, b in zip(c0, c1)),
         )
+
+    path_ijk = [lps_to_ijk(affine, point) for point in prompt.get("path_lps", [])]
+    scribble_image = lasso_image = interaction_bbox = None
+    if prompt_mode in ("scribble", "lasso"):
+        if len(path_ijk) < 2:
+            raise ValueError(f"{prompt_mode} prompt needs at least two path points")
+        axis = {"sagittal": 0, "coronal": 1, "axial": 2}.get(prompt.get("pane"))
+        if axis is None:
+            raise ValueError("path prompt needs a valid pane")
+        # The prompt is a 2D stroke/contour on exactly one viewing plane.
+        slice_index = int(round(sum(point[axis] for point in path_ijk) / len(path_ijk)))
+        shape = ct.shape
+        mask = np.zeros(shape, dtype=np.uint8)
+        path = [tuple(max(0, min(shape[d] - 1, int(point[d]))) for d in range(3)) for point in path_ijk]
+        path = [tuple(slice_index if d == axis else point[d] for d in range(3)) for point in path]
+        segments = list(zip(path, path[1:]))
+        if prompt_mode == "lasso":
+            segments.append((path[-1], path[0]))
+        for start, end in segments:
+            steps = max(abs(end[d] - start[d]) for d in range(3))
+            for t in np.linspace(0, 1, max(steps, 1) + 1):
+                voxel = tuple(int(round(start[d] + t * (end[d] - start[d]))) for d in range(3))
+                mask[voxel] = 1
+        bounds = []
+        for d, size in enumerate(shape):
+            if d == axis:
+                bounds.append([slice_index, slice_index + 1])
+            else:
+                values = [point[d] for point in path]
+                bounds.append([min(values), max(values) + 1])
+        interaction_bbox = bounds
+        mask = mask[tuple(slice(start, end) for start, end in bounds)]
+        if prompt_mode == "scribble":
+            scribble_image = mask
+        else:
+            lasso_image = mask
 
     # ── nnInteractive path ─────────────────────────────────────────────────
     # Import lazily so the module loads even when nninteractive-client is absent.
@@ -164,8 +201,11 @@ def segment_from_prompt(
         mask = predict(
             ct,
             case_key or "unkeyed",
-            point_ijk=seed if box_ijk is None else None,
+            point_ijk=seed if box_ijk is None and not path_ijk else None,
             box_ijk=box_ijk,
+            scribble_image=scribble_image,
+            lasso_image=lasso_image,
+            interaction_bbox=interaction_bbox,
         )
     except SessionExpiredError as e:
         # predict() already retried once; if we land here the session is gone.
