@@ -137,6 +137,9 @@ def predict(
     case_key: str,
     point_ijk=None,
     box_ijk=None,
+    scribble_image=None,
+    lasso_image=None,
+    interaction_bbox=None,
 ) -> np.ndarray:
     from nnInteractive.inference.remote.remote_session import SessionExpiredError
 
@@ -150,8 +153,12 @@ def predict(
             lo, hi = box_ijk
             axis_pairs = _corners_to_axis_pairs(lo, hi)
             session.add_bbox_interaction(axis_pairs, include_interaction=True)
+        elif scribble_image is not None:
+            session.add_scribble_interaction(scribble_image.astype(np.uint8, copy=False), include_interaction=True, interaction_bbox=interaction_bbox)
+        elif lasso_image is not None:
+            session.add_lasso_interaction(lasso_image.astype(np.uint8, copy=False), include_interaction=True, interaction_bbox=interaction_bbox)
         else:
-            raise ValueError("predict() needs point_ijk or box_ijk")
+            raise ValueError("predict() needs a point, box, scribble, or lasso prompt")
         return _target_buffer.copy()
 
     try:

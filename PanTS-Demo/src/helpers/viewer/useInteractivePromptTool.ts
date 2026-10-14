@@ -22,7 +22,7 @@ import {
 // everything this file does with it.
 type Point3 = [number, number, number];
 
-export type PromptMode = "point" | "box";
+export type PromptMode = "point" | "box" | "lasso" | "scribble";
 
 interface UseInteractivePromptToolArgs {
 	enabled: boolean;
@@ -54,10 +54,11 @@ export function useInteractivePromptTool({
 }: UseInteractivePromptToolArgs) {
 	const [dragStartCanvas, setDragStartCanvas] = useState<[number, number] | null>(null);
 	const [dragStartWorld, setDragStartWorld] = useState<Point3 | null>(null);
-	const [liveBoxCanvas, setLiveBoxCanvas] = useState<[[number, number], [number, number]] | null>(null);
+	const [liveBoxWorld, setLiveBoxWorld] = useState<[Point3, Point3] | null>(null);
+	const [pathDrawing, setPathDrawing] = useState(false);
+	const [livePathWorld, setLivePathWorld] = useState<Point3[]>([]);
 	const paneRef = useRef<CinePane | null>(null);
-	const paneElementRef = useRef<HTMLElement | null>(null);
-	const pointerIdRef = useRef<number | null>(null);
+	const pathRef = useRef<Point3[]>([]);
 	const busyRef = useRef(false);
 	// Drives the applying/success overlay (mirrors CopyAcrossSlicesFlyout's
 	// GuidedStepModal pattern) instead of the tool silently completing with
@@ -75,13 +76,14 @@ export function useInteractivePromptTool({
 	const reset = useCallback(() => {
 		setDragStartCanvas(null);
 		setDragStartWorld(null);
-		setLiveBoxCanvas(null);
+		setLiveBoxWorld(null);
 		paneRef.current = null;
-		paneElementRef.current = null;
-		pointerIdRef.current = null;
+		pathRef.current = [];
+		setPathDrawing(false);
+		setLivePathWorld([]);
 	}, []);
 
-	const submit = useCallback(async (_pane: CinePane, pointWorld: Point3, boxWorld?: [Point3, Point3]) => {
+	const submit = useCallback(async (_pane: CinePane, pointWorld: Point3, boxWorld?: [Point3, Point3], pathWorld?: Point3[]) => {
 		console.log("[ai-tool] submit called");
 		if (busyRef.current) {
 			console.log("[ai-tool] submit returned early reason=busy");
@@ -106,7 +108,7 @@ export function useInteractivePromptTool({
 				apiBase,
 				caseId,
 				activeSegmentIndex,
-				{ pointLps: pointWorld, boxLps: boxWorld, tolerance },
+				{ pointLps: pointWorld, boxLps: boxWorld, pathLps: pathWorld, promptMode: mode, pane: _pane, tolerance },
 				res,
 			);
 			if (blocked) {
@@ -121,7 +123,7 @@ export function useInteractivePromptTool({
 					setStatusMessage(null);
 				} else {
 					const engineLabel = engine === "nninteractive" ? "AI (nnInteractive)" : "fallback (nnInteractive unavailable)";
-					const msg = `Applied via ${engineLabel} — ${changed.toLocaleString()} voxels changed`;
+					const msg = `Applied via ${engineLabel} — ${changed.toLocaleString()} voxel${changed === 1 ? "" : "s"} changed`;
 					onLog?.(msg);
 					setStatus("success");
 					setStatusMessage(msg);
@@ -143,7 +145,7 @@ export function useInteractivePromptTool({
 			busyRef.current = false;
 			onBusyChange?.(false);
 		}
-	}, [apiBase, caseId, activeSegmentIndex, res, tolerance, onLog, onBusyChange, onComplete]);
+	}, [apiBase, caseId, activeSegmentIndex, res, mode, tolerance, onLog, onBusyChange, onComplete]);
 
 	const dismissStatus = useCallback(() => {
 		setStatus("idle");
@@ -194,40 +196,121 @@ export function useInteractivePromptTool({
 		void submit(pane, world);
 	};
 
-	// Box mode: pointerdown starts the drag, pointermove updates the live preview
-	// rectangle, pointerup submits both corners. Mirrors the pointer semantics a
-	// user already expects from the scissors' click-drag box operations.
-	const handlePointerDown = (pane: CinePane) => (e: ReactPointerEvent) => {
-		if (!enabled || mode !== "box") {
-			if (mode === "box" && busyRef.current) console.log("[ai-tool] box mousedown ignored reason=busy");
+	// Lasso and scribble start from mouse events; Box uses pointer events below
+	// so drag start, movement, and release share one event stream.
+	const handleMouseDown = (pane: CinePane) => (e: MouseEvent) => {
+		if (enabled && (mode === "lasso" || mode === "scribble")) {
+			const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+			const canvasPos: [number, number] = [e.clientX - rect.left, e.clientY - rect.top];
+			const world = canvasPointToWorld(pane, canvasPos);
+			if (!world || busyRef.current) return;
+			paneRef.current = pane;
+			pathRef.current = [world];
+			setLivePathWorld([world]);
+			setPathDrawing(true);
 			return;
 		}
-		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+	};
+
+	const handlePointerDown = (pane: CinePane) => (e: ReactPointerEvent<HTMLDivElement>) => {
+		if (!enabled || mode !== "box") return;
+		const rect = e.currentTarget.getBoundingClientRect();
 		const canvasPos: [number, number] = [e.clientX - rect.left, e.clientY - rect.top];
 		const world = canvasPointToWorld(pane, canvasPos);
-		if (!world) {
-			console.log("[ai-tool] box mousedown returned early reason=no world point");
-			return;
-		}
-		e.preventDefault();
-		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+		if (!world || busyRef.current) return;
 		paneRef.current = pane;
 		paneElementRef.current = e.currentTarget as HTMLElement;
 		pointerIdRef.current = e.pointerId;
 		setDragStartCanvas(canvasPos);
 		setDragStartWorld(world);
-		setLiveBoxCanvas([canvasPos, canvasPos]);
+		setLiveBoxWorld([world, world]);
 	};
 
-	const handlePointerMove = (pane: CinePane) => (e: ReactPointerEvent) => {
-		if (!enabled || mode !== "box" || paneRef.current !== pane || !dragStartCanvas) return;
+	const handleMouseMove = (pane: CinePane) => (e: MouseEvent) => {
+		if (enabled && (mode === "lasso" || mode === "scribble") && paneRef.current === pane && pathRef.current.length) {
+			const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+			const canvasPos: [number, number] = [e.clientX - rect.left, e.clientY - rect.top];
+			const world = canvasPointToWorld(pane, canvasPos);
+			if (world) { pathRef.current.push(world); setLivePathWorld((points) => [...points, world]); }
+			return;
+		}
+		if (mode === "box") return;
+	};
+
+	const handleMouseUp = (pane: CinePane) => (e: MouseEvent) => {
+		if (enabled && (mode === "lasso" || mode === "scribble") && paneRef.current === pane && pathRef.current.length) {
+			const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+			const world = canvasPointToWorld(pane, [e.clientX - rect.left, e.clientY - rect.top]);
+			if (world) pathRef.current.push(world);
+			const points = [...pathRef.current];
+			paneRef.current = null;
+			pathRef.current = [];
+			setPathDrawing(false);
+			setLivePathWorld([]);
+			if (points.length >= 2) void submit(pane, points[0], undefined, points);
+			return;
+		}
+		if (!enabled || mode !== "box" || paneRef.current !== pane || !dragStartWorld) {
+			if (mode === "box" && (enabled || paneRef.current || dragStartWorld)) {
+				const reason = !enabled ? "disabled" : paneRef.current !== pane ? "different pane" : "no drag start";
+				console.log(`[ai-tool] box mouseup returned early reason=${reason}`);
+			}
+			return;
+		}
 		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
 		const canvasPos: [number, number] = [e.clientX - rect.left, e.clientY - rect.top];
-		setLiveBoxCanvas([dragStartCanvas, canvasPos]);
+		const endWorld = canvasPointToWorld(pane, canvasPos);
+		const startWorld = dragStartWorld;
+		reset();
+		if (!endWorld) {
+			console.log("[ai-tool] box mouseup returned early reason=no end world point");
+			return;
+		}
+		// A click with ~no drag is treated as a degenerate box — submit as a
+		// point at the start position instead of an empty/near-empty box,
+		// which the backend's region_grow would otherwise clamp to nothing.
+		const dx = Math.abs(canvasPos[0] - (dragStartCanvas?.[0] ?? 0));
+		const dy = Math.abs(canvasPos[1] - (dragStartCanvas?.[1] ?? 0));
+		if (dx < 4 && dy < 4) {
+			void submit(pane, startWorld);
+		} else {
+			void submit(pane, startWorld, [startWorld, endWorld]);
+		}
 	};
 
-	// Pointer capture keeps drag events on the active pane; the window listener
-	// finishes the gesture once, even if the pointer leaves that pane.
+	useEffect(() => {
+		if (!enabled || !pathDrawing || (mode !== "lasso" && mode !== "scribble")) return;
+		const finishPath = (event: PointerEvent) => {
+			const pane = paneRef.current;
+			if (!pane || !pathRef.current.length) return;
+			const paneEl = document.querySelector(`.${pane}`) as HTMLElement | null;
+			if (paneEl) {
+				const rect = paneEl.getBoundingClientRect();
+				const canvasPos: [number, number] = [event.clientX - rect.left, event.clientY - rect.top];
+				const world = canvasPointToWorld(pane, canvasPos);
+				if (world) pathRef.current.push(world);
+			}
+			const points = [...pathRef.current];
+			paneRef.current = null;
+			pathRef.current = [];
+			setPathDrawing(false);
+			setLivePathWorld([]);
+			if (points.length >= 2) void submit(pane, points[0], undefined, points);
+		};
+		const cancelPath = (event: KeyboardEvent) => {
+			if (event.key === "Escape") reset();
+		};
+		window.addEventListener("pointerup", finishPath);
+		window.addEventListener("keydown", cancelPath);
+		return () => {
+			window.removeEventListener("pointerup", finishPath);
+			window.removeEventListener("keydown", cancelPath);
+		};
+	}, [enabled, pathDrawing, mode, submit, reset]);
+
+	// While a box drag is in progress, listen for pointerup and Escape on the
+	// window so the drag always completes (or cancels) even if the pointer
+	// leaves the pane div before the user releases.
 	useEffect(() => {
 		if (mode !== "box" || !dragStartWorld || !dragStartCanvas) return;
 
@@ -262,6 +345,16 @@ export function useInteractivePromptTool({
 			}
 			void submit(currentPane, startWorld, [startWorld, endWorld]);
 		};
+		const onPointerMove = (e: PointerEvent) => {
+			const currentPane = paneRef.current;
+			if (!currentPane) return;
+			const paneEl = document.querySelector(`.${currentPane}`) as HTMLElement | null;
+			if (!paneEl) return;
+			const rect = paneEl.getBoundingClientRect();
+			const canvasPos: [number, number] = [e.clientX - rect.left, e.clientY - rect.top];
+			const world = canvasPointToWorld(currentPane, canvasPos);
+			if (world) setLiveBoxWorld([dragStartWorld, world]);
+		};
 
 		const onKeyDown = (e: KeyboardEvent) => {
 			if (e.key === "Escape") {
@@ -270,9 +363,11 @@ export function useInteractivePromptTool({
 		};
 
 		window.addEventListener("pointerup", onPointerUp);
+		window.addEventListener("pointermove", onPointerMove);
 		window.addEventListener("keydown", onKeyDown);
 		return () => {
 			window.removeEventListener("pointerup", onPointerUp);
+			window.removeEventListener("pointermove", onPointerMove);
 			window.removeEventListener("keydown", onKeyDown);
 		};
 		// dragStartWorld/dragStartCanvas trigger the effect when a drag starts.
@@ -282,12 +377,16 @@ export function useInteractivePromptTool({
 	// Canvas-space live box for the overlay, reprojected against the CURRENT
 	// camera on every render, same reasoning as usePolygonDraw's toCanvas().
 	const pane = paneRef.current;
-	const liveBoxDisplay = liveBoxCanvas;
-	void worldToCanvasPoint; // referenced for parity with usePolygonDraw's reprojection pattern; box mode doesn't need it since it never stores world corners across a re-render before submit.
+	const liveBoxDisplay = liveBoxWorld && pane ? (() => {
+		const start = worldToCanvasPoint(pane, liveBoxWorld[0]);
+		const end = worldToCanvasPoint(pane, liveBoxWorld[1]);
+		return start && end ? [start, end] as const : null;
+	})() : null;
 
 	return {
 		pane,
 		liveBox: liveBoxDisplay,
+		livePathWorld,
 		status,
 		statusMessage,
 		pending,
@@ -295,8 +394,10 @@ export function useInteractivePromptTool({
 		reject,
 		dismissStatus,
 		handleClick,
+		handleMouseDown,
 		handlePointerDown,
-		handlePointerMove,
+		handleMouseMove,
+		handleMouseUp,
 		cancel: reset,
 		reset,
 	};

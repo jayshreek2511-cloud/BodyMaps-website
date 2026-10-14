@@ -2104,6 +2104,9 @@ export async function upgradeSegmentationVolume(fullResSegUrl: string): Promise<
 export interface InteractivePrompt {
   pointLps: Point3;
   boxLps?: [Point3, Point3];
+  pathLps?: Point3[];
+  promptMode?: "point" | "box" | "lasso" | "scribble";
+  pane?: CinePane;
   tolerance?: number;
 }
 
@@ -2199,6 +2202,11 @@ export async function submitInteractiveSegmentPrompt(
       [prompt.boxLps[0][0], prompt.boxLps[0][1], prompt.boxLps[0][2]],
       [prompt.boxLps[1][0], prompt.boxLps[1][1], prompt.boxLps[1][2]],
     ];
+  }
+  if (prompt.pathLps?.length) {
+    body.path_lps = prompt.pathLps;
+    body.prompt_mode = prompt.promptMode;
+    body.pane = prompt.pane;
   }
   if (prompt.tolerance != null) body.tolerance = prompt.tolerance;
 
@@ -2298,6 +2306,7 @@ export async function submitInteractiveSegmentPrompt(
   // flood (e.g. region_grow on soft tissue). Refuse without touching the labelmap.
   const totalVoxels = proposal.data.length;
   const proposedSet = proposal.data.reduce((n, v) => n + (v ? 1 : 0), 0);
+  if (proposedSet === 0) return { changed: 0, engine };
   if (proposedSet / totalVoxels > INTERACTIVE_MASK_MAX_FRACTION) {
     return {
       changed: 0,
@@ -2340,7 +2349,7 @@ export async function submitInteractiveSegmentPrompt(
     if (touchedIdx.length > 0) {
       const pending: PendingPromptHandle = {
         touchedIdx, priorValues, segmentIndex: activeSegmentIndex,
-        voxelCount: changed, engine, volume: segVolume, settled: false,
+        voxelCount: proposedSet, engine, volume: segVolume, settled: false,
       };
       _pendingPrompt = pending;
       return { changed, engine, blocked: undefined, pending };
