@@ -58,6 +58,8 @@ export function useInteractivePromptTool({
 	const [pathDrawing, setPathDrawing] = useState(false);
 	const [livePathWorld, setLivePathWorld] = useState<Point3[]>([]);
 	const paneRef = useRef<CinePane | null>(null);
+	const paneElementRef = useRef<HTMLElement | null>(null);
+	const pointerIdRef = useRef<number | null>(null);
 	const pathRef = useRef<Point3[]>([]);
 	const busyRef = useRef(false);
 	// Drives the applying/success overlay (mirrors CopyAcrossSlicesFlyout's
@@ -219,6 +221,8 @@ export function useInteractivePromptTool({
 		const world = canvasPointToWorld(pane, canvasPos);
 		if (!world || busyRef.current) return;
 		paneRef.current = pane;
+		paneElementRef.current = e.currentTarget as HTMLElement;
+		pointerIdRef.current = e.pointerId;
 		setDragStartCanvas(canvasPos);
 		setDragStartWorld(world);
 		setLiveBoxWorld([world, world]);
@@ -232,12 +236,7 @@ export function useInteractivePromptTool({
 			if (world) { pathRef.current.push(world); setLivePathWorld((points) => [...points, world]); }
 			return;
 		}
-		if (enabled && mode === "box" && paneRef.current === pane && dragStartWorld) {
-			const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-			const canvasPos: [number, number] = [e.clientX - rect.left, e.clientY - rect.top];
-			const world = canvasPointToWorld(pane, canvasPos);
-			if (world) setLiveBoxWorld([dragStartWorld, world]);
-		}
+		if (mode === "box") return;
 	};
 
 	const handleMouseUp = (pane: CinePane) => (e: MouseEvent) => {
@@ -318,21 +317,16 @@ export function useInteractivePromptTool({
 		if (mode !== "box" || !dragStartWorld || !dragStartCanvas) return;
 
 		const onPointerUp = (e: PointerEvent) => {
+			if (pointerIdRef.current !== e.pointerId) return;
 			const startWorld = dragStartWorld;
 			const startCanvas = dragStartCanvas;
-			// Compute end canvas position relative to the active pane element.
-			// The pane divs in VisualizationPage use class names matching the
-			// pane id: "axial", "sagittal", "coronal".
-			// Fall back to startCanvas if not found (submits as a point).
+			// Use the same pane element for both corners so their canvas positions
+			// are in the same coordinate system.
 			let endCanvasPos: [number, number] = startCanvas;
-			if (paneRef.current) {
-				const paneEl = document.querySelector(
-					`.${paneRef.current}`
-				) as HTMLElement | null;
-				if (paneEl) {
-					const rect = paneEl.getBoundingClientRect();
-					endCanvasPos = [e.clientX - rect.left, e.clientY - rect.top];
-				}
+			const paneEl = paneElementRef.current;
+			if (paneEl) {
+				const rect = paneEl.getBoundingClientRect();
+				endCanvasPos = [e.clientX - rect.left, e.clientY - rect.top];
 			}
 			const currentPane = paneRef.current;
 			reset();
@@ -348,10 +342,10 @@ export function useInteractivePromptTool({
 			const dx = Math.abs(endCanvasPos[0] - startCanvas[0]);
 			const dy = Math.abs(endCanvasPos[1] - startCanvas[1]);
 			if (dx < 4 && dy < 4) {
-				void submit(currentPane, startWorld);
-			} else {
-				void submit(currentPane, startWorld, [startWorld, endWorld]);
+				console.log("[ai-tool] box pointerup ignored reason=no box drag");
+				return;
 			}
+			void submit(currentPane, startWorld, [startWorld, endWorld]);
 		};
 		const onPointerMove = (e: PointerEvent) => {
 			const currentPane = paneRef.current;
