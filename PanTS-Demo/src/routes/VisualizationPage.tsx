@@ -5195,14 +5195,16 @@ const aiAvailableOrgans = useMemo(() => {
 			    every other guided-flow tool's confirmation. Rendered once
 			    globally (not per-pane, since a point-prompt submit doesn't
 			    stay anchored to one pane the way a box-drag does). */}
-			{[pointSegment, boxSegment, lassoSegment, scribbleSegment].some((tool) => tool.status === "success" || tool.status === "error") && (() => {
-				const active = [pointSegment, boxSegment, lassoSegment, scribbleSegment].find((tool) => tool.status === "success" || tool.status === "error")!;
+			{([pointSegment, boxSegment].some((tool) => tool.status === "applying") || [pointSegment, boxSegment, lassoSegment, scribbleSegment].some((tool) => tool.status === "success" || tool.status === "error")) && (() => {
+				const active = [pointSegment, boxSegment].find((tool) => tool.status === "applying") ?? [pointSegment, boxSegment, lassoSegment, scribbleSegment].find((tool) => tool.status === "success" || tool.status === "error")!;
+				const applying = active.status === "applying";
 				return (
 					<GuidedStepModal
-						title={active.status === "success" ? "Success" : "No change"}
-						instruction={active.statusMessage ?? ""}
+						title={applying ? "Applying" : active.status === "success" ? "Success" : "No change"}
+						instruction={applying ? "Sending the CT to the AI server. The first click on a case can take a few minutes." : active.statusMessage ?? ""}
 						primaryLabel="Got it"
 						onPrimary={active.dismissStatus}
+						busy={applying}
 					/>
 				);
 			})()}

@@ -232,7 +232,12 @@ export function useInteractivePromptTool({
 			if (world) { pathRef.current.push(world); setLivePathWorld((points) => [...points, world]); }
 			return;
 		}
-		if (mode === "box") return;
+		if (enabled && mode === "box" && paneRef.current === pane && dragStartWorld) {
+			const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+			const canvasPos: [number, number] = [e.clientX - rect.left, e.clientY - rect.top];
+			const world = canvasPointToWorld(pane, canvasPos);
+			if (world) setLiveBoxWorld([dragStartWorld, world]);
+		}
 	};
 
 	const handleMouseUp = (pane: CinePane) => (e: MouseEvent) => {

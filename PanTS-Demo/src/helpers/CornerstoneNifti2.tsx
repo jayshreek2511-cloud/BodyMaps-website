@@ -12,6 +12,7 @@ import type { MaskingArea } from "../components/segmentation/MaskingSelect";
 import { createOperationGeneration } from "./viewer/operationGeneration";
 import { rollbackVolumeUpgrade } from "./viewer/volumeUpgrade";
 import { addVolumeLabelmap } from "./viewer/addVolumeLabelmap";
+const INTERACTIVE_SEGMENT_REQUEST_TIMEOUT_MS = 300_000;
 type viewportIdTypes = 'CT_NIFTI_AXIAL' | 'CT_NIFTI_SAGITTAL' | 'CT_NIFTI_CORONAL';
 
 const {
@@ -2211,15 +2212,22 @@ export async function submitInteractiveSegmentPrompt(
   if (prompt.tolerance != null) body.tolerance = prompt.tolerance;
 
   let httpRes: Response;
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), INTERACTIVE_SEGMENT_REQUEST_TIMEOUT_MS);
   try {
     httpRes = await fetch(`${apiBase}/api/interactive-segment/${caseId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: controller.signal,
     });
   } catch (error) {
     console.log(`[ai-tool] response unavailable error=${error instanceof Error ? error.name : "unknown"}`);
-    throw error;
+    throw new Error(controller.signal.aborted
+      ? "AI request timed out after 5 minutes. Check Flask and the tunnel, then try again."
+      : "AI server not reachable - check Flask and the tunnel.");
+  } finally {
+    window.clearTimeout(timeoutId);
   }
   if (!httpRes.ok) {
     // The backend always returns {"error": "...", "reason": "<code>"} for failures.
