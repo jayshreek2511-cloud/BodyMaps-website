@@ -171,6 +171,53 @@ def segment_from_prompt(
             for t in np.linspace(0, 1, max(steps, 1) + 1):
                 voxel = tuple(int(round(start[d] + t * (end[d] - start[d]))) for d in range(3))
                 mask[voxel] = 1
+        if prompt_mode == "lasso":
+            in_plane_axes = [d for d in range(3) if d != axis]
+            polygon = [(point[in_plane_axes[0]], point[in_plane_axes[1]]) for point in path]
+            cross_sum = cx_sum = cy_sum = 0.0
+            for (x0, y0), (x1, y1) in zip(polygon, polygon[1:] + polygon[:1]):
+                cross = x0 * y1 - x1 * y0
+                cross_sum += cross
+                cx_sum += (x0 + x1) * cross
+                cy_sum += (y0 + y1) * cross
+            polygon_area = abs(cross_sum) / 2
+            min_x, max_x = min(point[0] for point in polygon), max(point[0] for point in polygon)
+            min_y, max_y = min(point[1] for point in polygon), max(point[1] for point in polygon)
+            if abs(cross_sum) > 1e-9:
+                centroid_x = cx_sum / (3 * cross_sum)
+                centroid_y = cy_sum / (3 * cross_sum)
+            else:
+                centroid_x = sum(point[0] for point in polygon) / len(polygon)
+                centroid_y = sum(point[1] for point in polygon) / len(polygon)
+
+            def mark_nearest_centroid():
+                mask.fill(0)
+                voxel = [0, 0, 0]
+                voxel[axis] = slice_index
+                voxel[in_plane_axes[0]] = max(0, min(shape[in_plane_axes[0]] - 1, int(round(centroid_x))))
+                voxel[in_plane_axes[1]] = max(0, min(shape[in_plane_axes[1]] - 1, int(round(centroid_y))))
+                mask[tuple(voxel)] = 1
+
+            if polygon_area < 1 and max_x - min_x <= 1 and max_y - min_y <= 1:
+                mark_nearest_centroid()
+            else:
+                x_values = np.arange(min_x, max_x + 1)
+                interior_voxels = 0
+                for y in range(min_y, max_y + 1):
+                    inside = np.zeros(x_values.shape, dtype=bool)
+                    for (x0, y0), (x1, y1) in zip(polygon, polygon[1:] + polygon[:1]):
+                        if (y0 > y) != (y1 > y):
+                            crossing_x = x0 + (y - y0) * (x1 - x0) / (y1 - y0)
+                            inside ^= x_values < crossing_x
+                    for x in x_values[inside]:
+                        voxel = [0, 0, 0]
+                        voxel[axis] = slice_index
+                        voxel[in_plane_axes[0]] = int(x)
+                        voxel[in_plane_axes[1]] = y
+                        mask[tuple(voxel)] = 1
+                        interior_voxels += 1
+                if interior_voxels == 0:
+                    mark_nearest_centroid()
         bounds = []
         for d, size in enumerate(shape):
             if d == axis:

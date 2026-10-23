@@ -2387,7 +2387,7 @@ function VisualizationPage({ liveRoom, soloChallenge, quizPractice }: Visualizat
 			// hdReady in the Annotate button) until this completes, since painting
 			// mid-swap would hit the same mismatch this is meant to fix.
 			if (segUrl) {
-				const segOk = await upgradeSegmentationVolume(`${API_BASE}/api/get-segmentations/${pantsCase}.nii.gz`);
+				const segOk = await upgradeSegmentationVolume(`${API_BASE}/api/get-segmentations/${pantsCase}.nii.gz`, pantsCase);
 				if (!segOk) {
 					// CT upgraded but mask didn't — don't claim "done" (which the
 					// Annotate button treats as a green light) while the mask is
@@ -2665,7 +2665,12 @@ function VisualizationPage({ liveRoom, soloChallenge, quizPractice }: Visualizat
 								ctUrl,
 								segUrl ?? undefined,
 								setLoading,
-								{ resourceKey: ctUrl, signal: controller.signal }
+								{
+									resourceKey: ctUrl,
+									signal: controller.signal,
+									caseId: /^\d+$/.test(String(pantsCase ?? "")) ? String(pantsCase) : undefined,
+									res: isHd ? "full" : "low",
+								}
 							),
 							controller.signal,
 							(result) => result.dispose()

@@ -4,7 +4,7 @@ import { cornerstoneNiftiImageLoader, createNiftiImageIdsAndCacheMetadata, init 
 import * as cornerstoneTools from '@cornerstonejs/tools';
 import { init as cornerstoneToolsInit } from '@cornerstonejs/tools';
 import { SegmentationRepresentations } from "@cornerstonejs/tools/enums";
-import { NEW_CLASS_PALETTE } from "./constants";
+import { API_BASE, NEW_CLASS_PALETTE } from "./constants";
 import vtkImageData from "@kitware/vtk.js/Common/DataModel/ImageData";
 import vtkDataArray from "@kitware/vtk.js/Common/Core/DataArray";
 import vtkImageMarchingCubes from "@kitware/vtk.js/Filters/General/ImageMarchingCubes";
@@ -13,6 +13,7 @@ import { createOperationGeneration } from "./viewer/operationGeneration";
 import { rollbackVolumeUpgrade } from "./viewer/volumeUpgrade";
 import { addVolumeLabelmap } from "./viewer/addVolumeLabelmap";
 const INTERACTIVE_SEGMENT_REQUEST_TIMEOUT_MS = 300_000;
+const BOX_CLIP_TO_RECT = true;
 type viewportIdTypes = 'CT_NIFTI_AXIAL' | 'CT_NIFTI_SAGITTAL' | 'CT_NIFTI_CORONAL';
 
 const {
@@ -514,7 +515,7 @@ export function subscribeToVolumeProgress(
 // tool registration. Mirrors the guard in compareViewer.ts.
 let _cornerstoneInited = false;
 
-export async function renderVisualization(ref1: HTMLDivElement, ref2: HTMLDivElement, ref3: HTMLDivElement, convertedColorLUT: ColorLUT, ctUrl: string, segUrl: string | undefined, _setLoading: React.Dispatch<React.SetStateAction<boolean>>, opts?: { ctImageIds?: string[]; resourceKey?: string; signal?: AbortSignal }) {
+export async function renderVisualization(ref1: HTMLDivElement, ref2: HTMLDivElement, ref3: HTMLDivElement, convertedColorLUT: ColorLUT, ctUrl: string, segUrl: string | undefined, _setLoading: React.Dispatch<React.SetStateAction<boolean>>, opts?: { ctImageIds?: string[]; resourceKey?: string; signal?: AbortSignal; caseId?: string | number; res?: "low" | "full" }) {
     if (!_cornerstoneInited) {
         coreInit();
         niftiImageLoaderInit();
@@ -763,6 +764,10 @@ export async function renderVisualization(ref1: HTMLDivElement, ref2: HTMLDivEle
     _currentCtVolumeId = ctVolumeId;
     segmentationId = segmentationURL ? segmentationVolumeId : "";
     _lastColorLUT = convertedColorLUT;
+    if (segmentationURL && opts?.caseId != null && opts.res) {
+        const attachedSegmentationVolume = cache.getVolume(segmentationVolumeId);
+        if (attachedSegmentationVolume) await restoreAcceptedPromptEdits(attachedSegmentationVolume, opts.caseId, opts.res, "initial", opts.signal);
+    }
     renderingEngine.renderViewports(viewportInputArray.map((viewport) => viewport.viewportId));
 
     // Local DICOM can be any modality (MR, PET, …), so the CT window presets are
@@ -2063,7 +2068,7 @@ export async function upgradeCtVolume(fullResCtUrl: string): Promise<string | nu
  * Returns true on success; false leaves the existing (low-res) labelmap in
  * place — caller should keep annotation disabled in that case.
  */
-export async function upgradeSegmentationVolume(fullResSegUrl: string): Promise<boolean> {
+export async function upgradeSegmentationVolume(fullResSegUrl: string, caseId?: string | number): Promise<boolean> {
   if (!cache.getVolume(segmentationId)) return false;
   try {
     const segmentationImageIds = await createNiftiImageIdsAndCacheMetadata({ url: fullResSegUrl });
@@ -2076,6 +2081,7 @@ export async function upgradeSegmentationVolume(fullResSegUrl: string): Promise<
     await newVolume.load();
 
     await _rebuildSegmentationRepresentations();
+    if (caseId != null) await restoreAcceptedPromptEdits(newVolume, caseId, "full", "hd-upgrade");
     return true;
   } catch (e) {
     console.warn("Full-res segmentation upgrade failed; keeping the low-res labelmap.", e);
@@ -2118,10 +2124,16 @@ export interface PendingPromptHandle {
   voxelCount: number;
   engine: string;
   volume: any;
+  apiBase: string;
+  caseId: string | number;
+  res: "low" | "full";
   settled: boolean;
 }
 
 let _pendingPrompt: PendingPromptHandle | null = null;
+const _acceptedEditSaveQueues = new Map<string, Promise<void>>();
+const _acceptedEditIds = new WeakMap<PendingPromptHandle, string>();
+let _lastRestoredVolumeIdentity: { caseId: string; volume: any; phase: string } | null = null;
 
 export function acceptPendingPrompt(handle: PendingPromptHandle): void {
   if (handle.settled || _pendingPrompt !== handle) return;
@@ -2140,6 +2152,175 @@ export function acceptPendingPrompt(handle: PendingPromptHandle): void {
     redo: () => applyAndRefresh(handle.touchedIdx.map(() => handle.segmentIndex)),
   });
   _pendingPrompt = null;
+}
+
+export async function saveAcceptedPromptEdits(handle: PendingPromptHandle, values = handle.touchedIdx.map(() => handle.segmentIndex)): Promise<void> {
+  if (!/^\d+$/.test(String(handle.caseId)) || !handle.touchedIdx.length) return;
+  let editId = _acceptedEditIds.get(handle);
+  if (!editId) {
+    editId = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    _acceptedEditIds.set(handle, editId);
+  }
+  const valuesBySegment = new Map<number, number[]>();
+  handle.touchedIdx.forEach((index, offset) => {
+    const segmentIndex = values[offset];
+    if (!Number.isInteger(index) || !Number.isInteger(segmentIndex) || segmentIndex < 0 || segmentIndex > 65535) return;
+    const indices = valuesBySegment.get(segmentIndex) ?? [];
+    indices.push(index);
+    valuesBySegment.set(segmentIndex, indices);
+  });
+  const edits = [...valuesBySegment].map(([segment_index, indices]) => {
+    indices.sort((a, b) => a - b);
+    const ranges: [number, number][] = [];
+    for (const index of indices) {
+      const last = ranges[ranges.length - 1];
+      if (last && last[0] + last[1] === index) last[1]++;
+      else ranges.push([index, 1]);
+    }
+    return { segment_index, ranges };
+  });
+  if (!edits.length) return;
+  const rangeEntries = edits.flatMap((edit) => edit.ranges.map((range) => ({ segment_index: edit.segment_index, range })));
+  const payloads: { res: "full"; dims: number[]; edit_id: string; chunk_index: number; chunk_count: number; edits: { segment_index: number; ranges: [number, number][] }[] }[] = [];
+  for (let offset = 0; offset < rangeEntries.length; offset += 800) {
+    const grouped = new Map<number, [number, number][]>();
+    for (const entry of rangeEntries.slice(offset, offset + 800)) {
+      const ranges = grouped.get(entry.segment_index) ?? [];
+      ranges.push(entry.range);
+      grouped.set(entry.segment_index, ranges);
+    }
+    payloads.push({
+      res: "full",
+      dims: [...handle.volume.dimensions],
+      edit_id: editId,
+      chunk_index: Math.floor(offset / 800),
+      chunk_count: Math.ceil(rangeEntries.length / 800),
+      edits: [...grouped].map(([segment_index, ranges]) => ({ segment_index, ranges })),
+    });
+  }
+  const voxelCount = handle.touchedIdx.length;
+  const queueKey = String(handle.caseId);
+  const previous = _acceptedEditSaveQueues.get(queueKey) ?? Promise.resolve();
+  const queued = previous.catch(() => undefined).then(async () => {
+    for (const payload of payloads) {
+      const chunkVoxelCount = payload.edits.reduce((total, edit) => total + edit.ranges.reduce((sum, range) => sum + range[1], 0), 0);
+      const response = await fetch(`${handle.apiBase}/api/save-accepted-edits/${handle.caseId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        keepalive: true,
+        body: JSON.stringify(payload),
+      });
+      console.log(`[persist] save status=${response.status} voxels=${chunkVoxelCount} res=full`);
+      if (!response.ok) throw new Error(`Could not save accepted segmentation edits (HTTP ${response.status}; ${chunkVoxelCount}/${voxelCount} voxels in this request).`);
+    }
+  });
+  _acceptedEditSaveQueues.set(queueKey, queued);
+  try {
+    await queued;
+  } finally {
+    if (_acceptedEditSaveQueues.get(queueKey) === queued) _acceptedEditSaveQueues.delete(queueKey);
+  }
+}
+
+async function restoreAcceptedPromptEdits(volume: any, caseId: string | number, res: "low" | "full", phase: "initial" | "hd-upgrade", signal?: AbortSignal): Promise<void> {
+  let recordsFound = 0;
+  let voxelsApplied = 0;
+  let assignments = 0;
+  let recordSignature = "none";
+  try {
+    const saved = await fetch(`${API_BASE}/api/get-accepted-edits/${caseId}?res=full`, { signal });
+    if (!saved.ok) return;
+    const { items = [] } = await saved.json();
+    recordsFound = items.length;
+    const signatureSource = JSON.stringify(items.map((record: any) => ({ res: record.res, dims: record.dims, segment_index: record.segment_index, indices: record.indices, edits: record.edits })));
+    let signatureHash = 2166136261;
+    for (let i = 0; i < signatureSource.length; i++) signatureHash = Math.imul(signatureHash ^ signatureSource.charCodeAt(i), 16777619);
+    recordSignature = (signatureHash >>> 0).toString(16).padStart(8, "0");
+    const dims = Array.from(volume.imageData.getDimensions()) as number[];
+    const scalars = (volume.voxelManager?.getCompleteScalarDataArray?.() ?? volume.scalarData) as Uint8Array | Uint16Array | Float32Array | undefined;
+    const roundHalfEven = (value: number) => {
+      const floor = Math.floor(value);
+      const fraction = value - floor;
+      return fraction === 0.5 ? (floor % 2 === 0 ? floor : floor + 1) : Math.round(value);
+    };
+    const exactGridRecords = items.filter((record: any) => record.dims?.length === 3 && record.dims.every((size: number, axis: number) => size === dims[axis])).length;
+    const lowGridRecords = items.filter((record: any) => record.res === "full" && record.dims?.length === 3 && record.dims.every((size: number, axis: number) => Number.isInteger(size) && roundHalfEven(size / 2) === dims[axis])).length;
+    console.log(`[persist] restore grid dims=${dims.join("x")} scalarArray=${Boolean(scalars)} exactRecords=${exactGridRecords} lowRecords=${lowGridRecords}`);
+    if (!scalars) return;
+    const expectedValues = new Map<number, number>();
+    for (const record of items) {
+      const sourceDims = record.dims as number[] | undefined;
+      if (!sourceDims || sourceDims.length !== 3 || sourceDims.some((size) => !Number.isInteger(size) || size <= 0)) continue;
+      const sameGrid = sourceDims.every((size, axis) => size === dims[axis]);
+      const canDownsampleFull = res === "low" && record.res === "full" && sourceDims.every((size, axis) => roundHalfEven(size / 2) === dims[axis]);
+      if (!sameGrid && !canDownsampleFull) continue;
+      const recordEdits = Array.isArray(record.edits)
+        ? record.edits
+        : [{ segment_index: record.segment_index, indices: record.indices }];
+      for (const edit of recordEdits) {
+        const sourceIndices: number[] = [];
+        if (Array.isArray(edit.ranges)) {
+          for (const range of edit.ranges) {
+            if (!Array.isArray(range) || range.length !== 2 || !Number.isInteger(range[0]) || !Number.isInteger(range[1]) || range[0] < 0 || range[1] <= 0) continue;
+            for (let index = range[0]; index < range[0] + range[1]; index++) sourceIndices.push(index);
+          }
+        } else if (Array.isArray(edit.indices)) {
+          for (const index of edit.indices) sourceIndices.push(index);
+        }
+        const targetIndices = canDownsampleFull ? new Set<number>() : null;
+        for (const sourceIndex of sourceIndices) {
+          if (!Number.isInteger(sourceIndex) || sourceIndex < 0 || sourceIndex >= sourceDims[0] * sourceDims[1] * sourceDims[2]) continue;
+          let targetIndex = sourceIndex;
+          if (targetIndices) {
+            const x = sourceIndex % sourceDims[0];
+            const y = Math.floor(sourceIndex / sourceDims[0]) % sourceDims[1];
+            const z = Math.floor(sourceIndex / (sourceDims[0] * sourceDims[1]));
+            const lowX = sourceDims[0] > 1 ? Math.floor(x * (dims[0] - 1) / (sourceDims[0] - 1) + 0.5) : 0;
+            const lowY = sourceDims[1] > 1 ? Math.floor(y * (dims[1] - 1) / (sourceDims[1] - 1) + 0.5) : 0;
+            const lowZ = sourceDims[2] > 1 ? Math.floor(z * (dims[2] - 1) / (sourceDims[2] - 1) + 0.5) : 0;
+            targetIndex = lowX + dims[0] * lowY + dims[0] * dims[1] * lowZ;
+            targetIndices.add(targetIndex);
+          } else if (targetIndex >= 0 && targetIndex < scalars.length) {
+            scalars[targetIndex] = edit.segment_index;
+            expectedValues.set(targetIndex, edit.segment_index);
+            assignments++;
+          }
+        }
+        if (targetIndices) {
+          for (const targetIndex of targetIndices) {
+            if (targetIndex >= 0 && targetIndex < scalars.length) {
+              scalars[targetIndex] = edit.segment_index;
+              expectedValues.set(targetIndex, edit.segment_index);
+              assignments++;
+            }
+          }
+        }
+      }
+    }
+    volume.voxelManager?.setCompleteScalarDataArray?.(scalars);
+    voxelsApplied = expectedValues.size;
+    if (voxelsApplied) _notifySegmentationChanged();
+    const targetVolumeId = segmentationId;
+    const verifyReadback = (when: "immediate" | "2s") => {
+      const readback = (volume.voxelManager?.getCompleteScalarDataArray?.() ?? volume.scalarData) as ArrayLike<number> | undefined;
+      let matching = 0;
+      if (readback) for (const [index, value] of expectedValues) if (readback[index] === value) matching++;
+      console.log(`[persist] verify phase=${phase} when=${when} expected=${expectedValues.size} matching=${matching} assignments=${assignments}`);
+      const attachedVolume = cache.getVolume(targetVolumeId);
+      if (attachedVolume !== volume) console.log(`[persist] volume identity changed phase=${phase} when=${when}`);
+    };
+    if (_lastRestoredVolumeIdentity?.caseId === String(caseId) && _lastRestoredVolumeIdentity.volume !== volume) {
+      console.log(`[persist] volume identity changed from=${_lastRestoredVolumeIdentity.phase} to=${phase}`);
+    }
+    _lastRestoredVolumeIdentity = { caseId: String(caseId), volume, phase };
+    verifyReadback("immediate");
+    window.setTimeout(() => verifyReadback("2s"), 2000);
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    console.warn("Could not restore the saved segmentation edits.", error);
+  } finally {
+    console.log(`[persist] restore records=${recordsFound} voxels=${voxelsApplied} assignments=${assignments} signature=${recordSignature} res=${res} phase=${phase}`);
+  }
 }
 
 export function rejectPendingPrompt(handle: PendingPromptHandle): void {
@@ -2309,6 +2490,23 @@ export async function submitInteractiveSegmentPrompt(
     };
   }
 
+  if (BOX_CLIP_TO_RECT && prompt.promptMode === "box" && prompt.boxLps && prompt.pane) {
+    const viewingAxis = { axial: 2, sagittal: 0, coronal: 1 }[prompt.pane];
+    const boxCorners = prompt.boxLps.map((point) =>
+      segVolume.imageData.worldToIndex(point).map((value: number) => Math.round(value))
+    ) as [[number, number, number], [number, number, number]];
+    const boxLo = [0, 1, 2].map((axis) => Math.min(boxCorners[0][axis], boxCorners[1][axis]));
+    const boxHi = [0, 1, 2].map((axis) => Math.max(boxCorners[0][axis], boxCorners[1][axis]));
+    const [dimX, dimY] = proposal.dims;
+    for (let idx = 0; idx < proposal.data.length; idx++) {
+      if (!proposal.data[idx]) continue;
+      const voxel = [idx % dimX, Math.floor(idx / dimX) % dimY, Math.floor(idx / (dimX * dimY))];
+      if ([0, 1, 2].some((axis) => axis !== viewingAxis && (voxel[axis] < boxLo[axis] || voxel[axis] > boxHi[axis]))) {
+        proposal.data[idx] = 0;
+      }
+    }
+  }
+
   // FIX B — size sanity guard: a proposal that would change more than
   // INTERACTIVE_MASK_MAX_FRACTION of the total volume is almost certainly a
   // flood (e.g. region_grow on soft tissue). Refuse without touching the labelmap.
@@ -2357,7 +2555,7 @@ export async function submitInteractiveSegmentPrompt(
     if (touchedIdx.length > 0) {
       const pending: PendingPromptHandle = {
         touchedIdx, priorValues, segmentIndex: activeSegmentIndex,
-        voxelCount: proposedSet, engine, volume: segVolume, settled: false,
+        voxelCount: proposedSet, engine, volume: segVolume, apiBase, caseId, res, settled: false,
       };
       _pendingPrompt = pending;
       return { changed, engine, blocked: undefined, pending };

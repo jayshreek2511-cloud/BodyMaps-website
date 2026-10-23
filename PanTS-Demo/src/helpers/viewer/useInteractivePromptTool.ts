@@ -11,6 +11,7 @@ import {
 	worldToCanvasPoint,
 	submitInteractiveSegmentPrompt,
 	acceptPendingPrompt,
+	saveAcceptedPromptEdits,
 	rejectPendingPrompt,
 	type PendingPromptHandle,
 	type CinePane,
@@ -155,10 +156,11 @@ export function useInteractivePromptTool({
 	}, []);
 
 	const accept = useCallback(() => {
-		if (!pending) return;
+		if (!pending || pending.settled) return;
 		acceptPendingPrompt(pending);
 		setPending(null);
 		setStatus("idle");
+		void saveAcceptedPromptEdits(pending).catch((error) => console.warn("Could not save accepted segmentation edits.", error));
 	}, [pending]);
 	const reject = useCallback(() => {
 		if (!pending) return;

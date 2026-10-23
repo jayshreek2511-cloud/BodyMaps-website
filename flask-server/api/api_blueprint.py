@@ -36,6 +36,7 @@ from models.base import db
 from constants import Constants
 import zipfile
 import json
+import hashlib
 import pandas as pd
 
 from pathlib import Path
@@ -7447,6 +7448,158 @@ def save_edited_mask(case_id):
     except Exception as error:
         print("[save_edited_mask error]", type(error).__name__, error)
         return jsonify({"error": "Failed to save the edited mask."}), 500
+
+
+@api_blueprint.route('/save-accepted-edits/<case_id>', methods=['POST'])
+def save_accepted_edits(case_id):
+    try:
+        if request.content_length and request.content_length > 64 * 1024 * 1024:
+            return jsonify({"error": "Accepted edits are too large."}), 413
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "Expected an accepted-edits JSON object."}), 400
+        res = payload.get("res")
+        if res not in {"low", "full"}:
+            return jsonify({"error": "Resolution must be 'low' or 'full'."}), 400
+        dims = payload.get("dims")
+        indices = payload.get("indices")
+        segment_index = payload.get("segment_index")
+        if not isinstance(dims, list) or len(dims) != 3 or any(type(size) is not int or size <= 0 for size in dims):
+            return jsonify({"error": "Accepted edits contain invalid voxel data."}), 400
+        voxel_total = dims[0] * dims[1] * dims[2]
+        edits = payload.get("edits")
+        if edits is not None:
+            if not isinstance(edits, list) or not edits:
+                return jsonify({"error": "Accepted edits contain invalid voxel data."}), 400
+            normalized_edits = []
+            changed_voxels = 0
+            for edit in edits:
+                edit_segment = edit.get("segment_index") if isinstance(edit, dict) else None
+                ranges = edit.get("ranges") if isinstance(edit, dict) else None
+                if type(edit_segment) is not int or edit_segment < 0 or edit_segment > 65535 or not isinstance(ranges, list):
+                    return jsonify({"error": "Accepted edits contain invalid voxel data."}), 400
+                previous_end = -1
+                for value in ranges:
+                    if (
+                        not isinstance(value, list) or len(value) != 2
+                        or type(value[0]) is not int or type(value[1]) is not int
+                        or value[0] < previous_end or value[1] <= 0
+                        or value[0] + value[1] > voxel_total
+                    ):
+                        return jsonify({"error": "Accepted edits contain invalid voxel data."}), 400
+                    previous_end = value[0] + value[1]
+                    changed_voxels += value[1]
+                    if changed_voxels > 10_000_000:
+                        return jsonify({"error": "Accepted edits contain invalid voxel data."}), 400
+                normalized_edits.append({"segment_index": edit_segment, "ranges": ranges})
+            saved_payload = {"res": res, "dims": dims, "edits": normalized_edits}
+        else:
+            if (
+                not isinstance(indices, list) or len(indices) > 10_000_000
+                or type(segment_index) is not int or segment_index <= 0 or segment_index > 65535
+                or any(type(index) is not int or index < 0 or index >= voxel_total for index in indices)
+            ):
+                return jsonify({"error": "Accepted edits contain invalid voxel data."}), 400
+            changed_voxels = len(indices)
+            saved_payload = {"res": res, "dims": dims, "segment_index": segment_index, "indices": indices}
+        out_dir = _edited_masks_dir(case_id)
+        os.makedirs(out_dir, exist_ok=True)
+        edit_id = payload.get("edit_id")
+        chunk_index = payload.get("chunk_index")
+        chunk_count = payload.get("chunk_count")
+        if edit_id is not None and (
+            not isinstance(edit_id, str) or not edit_id or len(edit_id) > 128
+            or type(chunk_index) is not int or chunk_index < 0
+            or type(chunk_count) is not int or chunk_count <= chunk_index
+        ):
+            return jsonify({"error": "Accepted edits contain invalid edit metadata."}), 400
+        if edit_id is not None:
+            saved_payload.update({"edit_id": edit_id, "chunk_index": chunk_index, "chunk_count": chunk_count})
+
+        def canonical_ranges(record):
+            record_edits = record.get("edits")
+            if isinstance(record_edits, list):
+                return sorted(
+                    ({"segment_index": edit.get("segment_index"), "ranges": sorted(edit.get("ranges", []))}
+                     for edit in record_edits if isinstance(edit, dict)),
+                    key=lambda edit: edit["segment_index"],
+                )
+            record_indices = record.get("indices", [])
+            grouped = {}
+            for index in sorted(set(record_indices)):
+                grouped.setdefault(record.get("segment_index"), []).append(index)
+            canonical = []
+            for value, values in sorted(grouped.items()):
+                ranges = []
+                for index in values:
+                    if ranges and ranges[-1][0] + ranges[-1][1] == index:
+                        ranges[-1][1] += 1
+                    else:
+                        ranges.append([index, 1])
+                canonical.append({"segment_index": value, "ranges": ranges})
+            return canonical
+
+        normalized_signature = canonical_ranges(saved_payload)
+        indices_hash = hashlib.sha256(json.dumps(normalized_signature, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+        saved_payload["indices_hash"] = indices_hash
+        same_resolution_names = sorted(
+            (name for name in os.listdir(out_dir) if name.startswith(f"accepted_edits_{res}_") and name.endswith(".json")),
+            key=lambda name: name.rsplit("_", 1)[-1],
+        )
+        for name in same_resolution_names:
+            with open(os.path.join(out_dir, name), "r", encoding="utf-8") as f:
+                previous_record = json.load(f)
+            if edit_id is not None and previous_record.get("edit_id") == edit_id and previous_record.get("chunk_index") == chunk_index:
+                return jsonify({"saved": True, "duplicate": True, "count": 0})
+        if same_resolution_names:
+            with open(os.path.join(out_dir, same_resolution_names[-1]), "r", encoding="utf-8") as f:
+                newest_record = json.load(f)
+            newest_signature = canonical_ranges(newest_record)
+            newest_hash = newest_record.get("indices_hash") or hashlib.sha256(
+                json.dumps(newest_signature, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            newest_segment = newest_record.get("segment_index")
+            if newest_segment is None and len(newest_signature) == 1:
+                newest_segment = newest_signature[0]["segment_index"]
+            current_segment = saved_payload.get("segment_index")
+            if current_segment is None and len(normalized_signature) == 1:
+                current_segment = normalized_signature[0]["segment_index"]
+            if newest_record.get("dims") == dims and newest_segment == current_segment and newest_hash == indices_hash:
+                return jsonify({"saved": True, "duplicate": True, "count": 0})
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = f"accepted_edits_{res}_{timestamp}.json"
+        with open(os.path.join(out_dir, filename), "w", encoding="utf-8") as f:
+            json.dump(saved_payload, f)
+        return jsonify({"saved": True, "count": changed_voxels})
+    except Exception as error:
+        print("[save_accepted_edits error]", type(error).__name__, error)
+        return jsonify({"error": "Failed to save accepted edits."}), 500
+
+
+@api_blueprint.route('/get-accepted-edits/<case_id>', methods=['GET'])
+def get_accepted_edits(case_id):
+    try:
+        res = request.args.get("res", "full")
+        if res not in {"low", "full"}:
+            return jsonify({"error": "Resolution must be 'low' or 'full'."}), 400
+        out_dir = _edited_masks_dir(case_id)
+        if not os.path.isdir(out_dir):
+            return jsonify({"items": []})
+        names = [
+            name for name in os.listdir(out_dir)
+            if name.startswith(("accepted_edits_low_", "accepted_edits_full_")) and name.endswith(".json")
+        ]
+        names.sort(key=lambda name: name.rsplit("_", 1)[-1])
+        if not names:
+            return jsonify({"items": []})
+        items = []
+        for name in names:
+            with open(os.path.join(out_dir, name), "r", encoding="utf-8") as f:
+                items.append(json.load(f))
+        return jsonify({"items": items})
+    except Exception as error:
+        print("[get_accepted_edits error]", type(error).__name__, error)
+        return jsonify({"error": "Failed to load accepted edits."}), 500
 
 
 @api_blueprint.route('/list-edited-masks/<case_id>', methods=['GET'])
